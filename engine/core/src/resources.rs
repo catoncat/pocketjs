@@ -28,7 +28,7 @@ impl RenderResources for Ui {
     }
     fn font_atlas(&self, slot: u8) -> Option<FontView<'_>> {
         Ui::font_atlas(self, slot).map(|atlas| FontView {
-            bitmap: &atlas.bitmap,
+            bitmap: atlas.bitmap_slice(),
             cell_w: atlas.cell_w,
             cell_h: atlas.cell_h,
             raster_density: atlas.raster_density,

@@ -4,7 +4,7 @@ pub use pocket_glyph_pages::{FontPage, MAX_PAGES, PAGE_DIM, PAGE_WIDTH};
 
 pub(crate) fn view(atlas: &Atlas) -> pocket_drivers::FontView<'_> {
     pocket_drivers::FontView {
-        bitmap: &atlas.bitmap,
+        bitmap: atlas.bitmap_slice(),
         cell_w: atlas.cell_w,
         cell_h: atlas.cell_h,
         raster_density: atlas.raster_density,
@@ -28,7 +28,7 @@ impl FontPages {
             atlas.slot,
             atlas.texture_coverage_width(),
         )?;
-        self.0.get(source, revision, gid, 0)
+        self.0.get(source, atlas.content_revision(revision), gid, 0)
     }
 }
 
@@ -95,11 +95,11 @@ mod tests {
     fn same_address_same_size_replacement_obeys_font_revision() {
         let mut atlas = atlas(256);
         let mut cache = FontPages::default();
-        let address = atlas.bitmap.as_ptr();
+        let address = atlas.bitmap_slice().as_ptr();
         assert_eq!(pixel(cache.get(&atlas, 1, 1).unwrap().0, 1), 0x2fff);
         cache.retire_frame();
         atlas.bitmap.fill(255);
-        assert_eq!(atlas.bitmap.as_ptr(), address);
+        assert_eq!(atlas.bitmap_slice().as_ptr(), address);
         let (page, upload) = cache.get(&atlas, 2, 1).unwrap();
         assert!(upload);
         assert_eq!(pixel(page, 1), 0xffff);
@@ -126,5 +126,71 @@ mod tests {
             assert_eq!(pixel(page, gid), (((gid % 15) + 1) << 12) | 0xfff);
         }
         assert!(cache.resident_bytes() <= 256 * 1024);
+    }
+
+    #[test]
+    fn dynamic_cell_fill_invalidates_font_pages_cache() {
+        let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+        let ttf_bytes: &'static [u8] = Box::leak(
+            std::fs::read(&ttf_path)
+                .expect("DroidSansFallbackFull.ttf must exist")
+                .into_boxed_slice(),
+        );
+        let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+        let mut bytes = vec![0u8; 16 + 2 * (8 + 16 * 16)];
+        bytes[..4].copy_from_slice(&crate::spec::font_atlas::MAGIC.to_le_bytes());
+        bytes[4..6].copy_from_slice(&crate::spec::font_atlas::VERSION.to_le_bytes());
+        bytes[6..8].copy_from_slice(&2u16.to_le_bytes());
+        bytes[8..16].copy_from_slice(&[16, 16, 13, 16, 0, 0, 1, 0]);
+        for &(i, cp, gid) in &[(0usize, 65u32, 1u16), (1, 0xfffd, 0)] {
+            let at = 16 + i * 8;
+            bytes[at..at + 4].copy_from_slice(&cp.to_le_bytes());
+            bytes[at + 4..at + 6].copy_from_slice(&gid.to_le_bytes());
+            bytes[at + 6] = 16;
+        }
+
+        let mut atlas = Atlas::parse_with_fallback(&bytes, font_ref).unwrap();
+        let dyn_gid = atlas.baked_count;
+        let mut cache = FontPages::default();
+
+        let page_cell_has_ink = |page: &FontPage, gid: u16| -> bool {
+            let local = u32::from(gid - page.first);
+            let gx = (local % page.cols) * 16;
+            let gy = (local / page.cols) * 16;
+            let pixels = unsafe {
+                core::slice::from_raw_parts(
+                    page.pixels.as_ptr() as *const u16,
+                    page.pixels.len() * 8,
+                )
+            };
+            for y in 0..16u32 {
+                for x in 0..16u32 {
+                    let px = pixels[((gy + y) * page.width + gx + x) as usize];
+                    if (px >> 12) > 0 {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+
+        // Upload the page while dynamic tail cell `dyn_gid` is still blank.
+        let (page_before, uploaded_before) = cache.get(&atlas, 1, dyn_gid).unwrap();
+        assert!(uploaded_before);
+        assert!(!page_cell_has_ink(page_before, dyn_gid));
+        cache.retire_frame();
+
+        // Fill `dyn_gid` dynamically; base revision `1` is unchanged, but
+        // `atlas.dynamic_revision()` bumped so `FontPages` MUST re-upload.
+        let epoch = atlas.begin_batch();
+        let (gid, _, _) = atlas
+            .prepare_dynamic_glyph('你' as u32, epoch)
+            .expect("CJK fallback glyph");
+        assert_eq!(gid, dyn_gid);
+        let (page_after, uploaded_after) = cache.get(&atlas, 1, dyn_gid).unwrap();
+        assert!(uploaded_after, "dynamic cell write must invalidate cached FontPage");
+        assert!(page_cell_has_ink(page_after, dyn_gid));
     }
 }

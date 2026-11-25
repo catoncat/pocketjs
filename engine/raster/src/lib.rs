@@ -45,10 +45,26 @@
 
 #![no_std]
 
+use core::sync::atomic::{AtomicU8, Ordering};
 use pocket_drivers::DamageRect;
 use pocket_drivers::RenderResources;
 use pocket_drivers::TexView;
 use pocket_spec::{self as spec, draw_op};
+
+/// Optional process-wide 1-bit crisp glyph coverage threshold (`0` = smooth
+/// grayscale AA, `> 0` = non-maximum-suppressed 1-bit crisp mode with high
+/// threshold `T` and ridge preservation down to `(T * 9) / 16`).
+static GLYPH_CRISP_THRESHOLD: AtomicU8 = AtomicU8::new(0);
+
+#[inline]
+pub fn set_glyph_crisp_threshold(threshold: u8) {
+    GLYPH_CRISP_THRESHOLD.store(threshold, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn glyph_crisp_threshold() -> u8 {
+    GLYPH_CRISP_THRESHOLD.load(Ordering::Relaxed)
+}
 
 mod surface;
 pub use surface::{
@@ -1012,6 +1028,50 @@ pub fn coverage_index(
     ((((2 * destination_px + 1) * atlas_density) / (2 * output_scale)).clamp(0, limit - 1)) as usize
 }
 
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn crisp_glyph_pixel(
+    rows: &[u8],
+    bpr: usize,
+    cov_w: usize,
+    cov_h: usize,
+    cx: usize,
+    sy: usize,
+    cov: u32,
+    lo: u32,
+    hi: u32,
+) -> bool {
+    if cov >= hi {
+        return true;
+    }
+    if cov < lo {
+        return false;
+    }
+    let up = if sy > 0 { rows[(sy - 1) * bpr + cx] as u32 } else { 0 };
+    let dn = if sy + 1 < cov_h { rows[(sy + 1) * bpr + cx] as u32 } else { 0 };
+    let lt = if cx > 0 { rows[sy * bpr + cx - 1] as u32 } else { 0 };
+    let rt = if cx + 1 < cov_w { rows[sy * bpr + cx + 1] as u32 } else { 0 };
+    // Never bridge a 1px gap/valley between two brighter strokes (e.g. `i` dot-stem gap, `三`, `m`).
+    if (up > cov && dn > cov) || (lt > cov && rt > cov) {
+        return false;
+    }
+    // Horizontal stroke ridge (`up`/`dn` peak): ignore 1px side-fringe of an already-solid vertical stem.
+    if up < hi
+        && dn < hi
+        && cov > up
+        && cov >= dn
+        && !((lt >= hi && rt < lo) || (rt >= hi && lt < lo))
+    {
+        return true;
+    }
+    // Vertical stroke ridge (`lt`/`rt` peak): ignore 1px top/bottom fringe of an already-solid horizontal arch.
+    lt < hi
+        && rt < hi
+        && cov > lt
+        && cov >= rt
+        && !((up >= hi && dn < lo) || (dn >= hi && up < lo))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn glyph_run<T: RenderTarget>(
     ui: &(impl RenderResources + ?Sized),
@@ -1036,6 +1096,8 @@ fn glyph_run<T: RenderTarget>(
     let coverage_w = atlas.coverage_width() as i32;
     let coverage_h = atlas.coverage_height() as i32;
     let bpr = atlas.bytes_per_row();
+    let crisp_hi = GLYPH_CRISP_THRESHOLD.load(Ordering::Relaxed) as u32;
+    let crisp_lo = (crisp_hi * 9) / 16;
     for pair in glyphs.as_chunks::<2>().0.iter() {
         let (gx, gy) = xy(pair[0], output_scale);
         let gid = (pair[1] & 0xffff) as u16;
@@ -1051,14 +1113,52 @@ fn glyph_run<T: RenderTarget>(
             continue;
         }
         let rows = atlas.glyph_rows(gid);
-        for py in y0..y1 {
-            let sy = coverage_index(py - gy, output_scale, atlas_density, coverage_h);
-            let row = &rows[sy * bpr..];
-            for px in x0..x1 {
-                let cx = coverage_index(px - gx, output_scale, atlas_density, coverage_w);
-                let cov = row[cx] as u32;
-                if cov != 0 {
-                    target.blend((py * stride + px) as usize, r, g, b, (a * cov + 127) / 255);
+        if crisp_hi == 0 {
+            for py in y0..y1 {
+                let sy = coverage_index(py - gy, output_scale, atlas_density, coverage_h);
+                let row = &rows[sy * bpr..];
+                for px in x0..x1 {
+                    let cx = coverage_index(px - gx, output_scale, atlas_density, coverage_w);
+                    let cov = row[cx] as u32;
+                    if cov != 0 {
+                        target.blend((py * stride + px) as usize, r, g, b, (a * cov + 127) / 255);
+                    }
+                }
+            }
+        } else if crisp_hi == 1 {
+            for py in y0..y1 {
+                let sy = coverage_index(py - gy, output_scale, atlas_density, coverage_h);
+                let row = &rows[sy * bpr..];
+                for px in x0..x1 {
+                    let cx = coverage_index(px - gx, output_scale, atlas_density, coverage_w);
+                    let cov = row[cx] as u32;
+                    if cov > 26 {
+                        let boosted = ((cov - 26) * 255 / 132).min(255);
+                        target.blend((py * stride + px) as usize, r, g, b, (a * boosted + 127) / 255);
+                    }
+                }
+            }
+        } else {
+            let cov_w_u = coverage_w as usize;
+            let cov_h_u = coverage_h as usize;
+            for py in y0..y1 {
+                let sy = coverage_index(py - gy, output_scale, atlas_density, coverage_h);
+                let row = &rows[sy * bpr..];
+                for px in x0..x1 {
+                    let cx = coverage_index(px - gx, output_scale, atlas_density, coverage_w);
+                    let cov = row[cx] as u32;
+                    if cov != 0
+                        && crisp_glyph_pixel(
+                            rows, bpr, cov_w_u, cov_h_u, cx, sy, cov, crisp_lo, crisp_hi,
+                        )
+                    {
+                        let idx = (py * stride + px) as usize;
+                        if a >= 255 {
+                            target.fill_opaque(idx, 1, r, g, b);
+                        } else {
+                            target.blend(idx, r, g, b, a);
+                        }
+                    }
                 }
             }
         }
@@ -1336,5 +1436,47 @@ fn tex_quad<T: RenderTarget>(
             }
             target.blend((py * stride + px) as usize, r, g, b, a);
         }
+    }
+}
+
+#[cfg(test)]
+mod crisp_tests {
+    use super::*;
+
+    #[test]
+    fn crisp_glyph_pixel_preserves_thin_ridges_without_fattening_50_50_splits() {
+        let hi = 136u32;
+        let lo = (hi * 9) / 16; // 76
+        // 4 rows x 3 cols:
+        // row 0: 0
+        // row 1: 128 (50/50 split top) -> ON
+        // row 2: 128 (50/50 split bottom) -> OFF
+        // row 3: 0
+        let cell_split = [0u8, 0, 0, 128, 128, 128, 128, 128, 128, 0, 0, 0];
+        assert!(crisp_glyph_pixel(&cell_split, 3, 3, 4, 1, 1, 128, lo, hi));
+        assert!(!crisp_glyph_pixel(&cell_split, 3, 3, 4, 1, 2, 128, lo, hi));
+
+        // Thin CJK horizontal stroke split 92 / 92: row 1 ON, row 2 OFF!
+        let cell_thin = [0u8, 0, 0, 92, 92, 92, 92, 92, 92, 0, 0, 0];
+        assert!(crisp_glyph_pixel(&cell_thin, 3, 3, 4, 1, 1, 92, lo, hi));
+        assert!(!crisp_glyph_pixel(&cell_thin, 3, 3, 4, 1, 2, 92, lo, hi));
+
+        // Genuine 2px bold stroke (190 / 190 >= 136): both ON!
+        let cell_bold = [0u8, 0, 0, 190, 190, 190, 190, 190, 190, 0, 0, 0];
+        assert!(crisp_glyph_pixel(&cell_bold, 3, 3, 4, 1, 1, 190, lo, hi));
+        assert!(crisp_glyph_pixel(&cell_bold, 3, 3, 4, 1, 2, 190, lo, hi));
+
+        // Lowercase `i` dot (row 0 = 210), 1px gap (row 1 = 92), stem (row 2 = 220): gap MUST stay OFF!
+        let cell_i = [0u8, 210, 0, 0, 92, 0, 0, 220, 0, 0, 220, 0];
+        assert!(crisp_glyph_pixel(&cell_i, 3, 3, 4, 1, 0, 210, lo, hi));
+        assert!(!crisp_glyph_pixel(&cell_i, 3, 3, 4, 1, 1, 92, lo, hi));
+        assert!(crisp_glyph_pixel(&cell_i, 3, 3, 4, 1, 2, 220, lo, hi));
+
+        // Hollow bowl of `d`: top arch (row 0 = 200 >= hi), hollow fringe (row 1 = 82), center (row 2 = 0) -> fringe stays OFF,
+        // while a genuine vertical T-junction (row 0 = 200 >= hi, row 1 = 92, row 2 = 92 >= lo) stays ON!
+        let cell_bowl = [0u8, 200, 0, 0, 82, 0, 0, 0, 0];
+        assert!(!crisp_glyph_pixel(&cell_bowl, 3, 3, 3, 1, 1, 82, lo, hi));
+        let cell_tjunc = [0u8, 200, 0, 0, 92, 0, 0, 92, 0];
+        assert!(crisp_glyph_pixel(&cell_tjunc, 3, 3, 3, 1, 1, 92, lo, hi));
     }
 }

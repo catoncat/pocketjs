@@ -103,7 +103,9 @@ impl Guest for RquickjsGuest {
     }
     fn frame(&mut self, frame: &GuestFrame<'_>) -> Result<(), RuntimeError> {
         let context = self.context.as_ref().ok_or(RuntimeError::Guest)?;
-        let result = context.with(|ctx| call_frame(&ctx, frame));
+        let result = context.with(|ctx| {
+            call_frame(&ctx, frame).map_err(|error| engine_error(&ctx, error))
+        });
         self.remember(result)?;
         self.collect()
     }
@@ -111,7 +113,21 @@ impl Guest for RquickjsGuest {
         if let Some(runtime) = &self.runtime {
             while runtime.is_job_pending() {
                 if let Err(error) = runtime.execute_pending_job() {
-                    self.last_error = Some(error.to_string());
+                    let message = self
+                        .context
+                        .as_ref()
+                        .map(|context| {
+                            context.with(|ctx| {
+                                let value = ctx.catch();
+                                if !value.is_undefined() {
+                                    format_js_thrown(&ctx, value, &error.to_string())
+                                } else {
+                                    error.to_string()
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|| error.to_string());
+                    self.last_error = Some(message);
                     return Err(RuntimeError::Guest);
                 }
             }
@@ -210,12 +226,35 @@ pub fn call_frame(ctx: &Ctx<'_>, frame: &GuestFrame<'_>) -> rquickjs::Result<()>
     ]),))
 }
 
+fn format_js_thrown<'js>(ctx: &Ctx<'js>, value: Value<'js>, fallback: &str) -> String {
+    let mut msg = Coerced::<String>::from_js(ctx, value.clone())
+        .map(|v| v.0)
+        .unwrap_or_else(|_| fallback.to_string());
+    if let Some(obj) = value.as_object() {
+        if let Ok(cause) = obj.get::<_, Value>("cause") {
+            if !cause.is_undefined() {
+                let cause_str = Coerced::<String>::from_js(ctx, cause.clone())
+                    .map(|v| v.0)
+                    .or_else(|_| ctx.json_stringify(cause.clone()).map(|o| o.and_then(|s| s.to_string().ok()).unwrap_or_default()))
+                    .unwrap_or_else(|_| format!("{cause:?}"));
+                let cause_stack = cause
+                    .as_exception()
+                    .and_then(|e| e.stack())
+                    .unwrap_or_default();
+                msg.push_str(&format!(" [cause: {cause_str} {cause_stack}]"));
+            }
+        }
+    }
+    if let Some(stack) = value.as_exception().and_then(|exc| exc.stack()) {
+        return format!("{msg}\n{stack}");
+    }
+    msg
+}
+
 fn engine_error(ctx: &Ctx<'_>, error: rquickjs::Error) -> String {
     if matches!(error, rquickjs::Error::Exception) {
         let value = ctx.catch();
-        return Coerced::<String>::from_js(ctx, value)
-            .map(|value| value.0)
-            .unwrap_or_else(|_| error.to_string());
+        return format_js_thrown(ctx, value, &error.to_string());
     }
     error.to_string()
 }

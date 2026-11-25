@@ -456,6 +456,7 @@ export async function bakeAtlases(opts: BakeOptions): Promise<BakedAtlas[]> {
   };
   const fallbacks: Font[] = [];
   for (const path of opts.fallbackTtfs ?? []) {
+    if (!(await Bun.file(path).exists())) continue;
     opts.onRead?.(path);
     fallbacks.push(await loadFont(path));
   }

@@ -22,6 +22,7 @@
 //! core when it waits or finishes a turn (worker.rs). A request thread never
 //! touches the core, so close returns at once and a late answer is dropped.
 use crate::device::Device;
+use crate::rex::{transport::Waker, RexZeroEngine};
 use crate::worker::{
     pocket_worker_emit, pocket_worker_finish, Core, Driver, Notify, BUSY, FACT_DATA, FACT_HEADERS,
     FAILED, INVALID, MAX_PAYLOAD, OK, UNKNOWN,
@@ -33,8 +34,8 @@ use std::{
     net::{SocketAddr, TcpStream},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
     },
     time::Duration,
 };
@@ -53,6 +54,12 @@ const MAX_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_RESPONSE_BYTES: usize = 128 * 1024;
 const MAX_RESPONSE_BYTES: usize = 256 * 1024;
 
+/// Hard upper bound on live `"pocket-http"` threads independent of closed resource handles,
+/// with dedicated reserved capacity so `/rex/wait` can never starve interactive actions!
+const MAX_TOTAL_HTTP_THREADS: usize = 12;
+const MAX_WAIT_HTTP_THREADS: usize = 4;
+const MAX_LIVE_WAIT_RESOURCES: usize = 2;
+
 /// Where a request goes.
 #[derive(Clone)]
 enum Route {
@@ -64,6 +71,11 @@ enum Route {
     /// The device API; the path without its query.
     Device {
         path: String,
+    },
+    /// The native Rex Zero engine (`http://zero/rex/*`).
+    Rex {
+        path: String,
+        query: String,
     },
     Loopback {
         port: u16,
@@ -130,6 +142,10 @@ struct Resource {
     started: Option<u32>,
     /// The worker cancelled the request; its thread's answer is dropped.
     cancelled: bool,
+    /// Shared cancellation flag signaled on `cancel()` or `close()` so blocking waits exit immediately.
+    cancel_token: Arc<AtomicBool>,
+    /// Whether this resource holds one of the reserved `/rex/wait` admission slots.
+    wait_slot_active: bool,
     /// Body bytes emitted into the core.
     delivered: u64,
 }
@@ -138,6 +154,78 @@ struct Resource {
 struct State {
     resources: HashMap<u32, Resource>,
     facts: VecDeque<Fact>,
+    live_wait_resources: usize,
+}
+
+#[derive(Default)]
+struct LimiterCounts {
+    total_threads: usize,
+    wait_threads: usize,
+}
+
+#[derive(Default)]
+struct ThreadLimiter {
+    counts: Mutex<LimiterCounts>,
+    cv: Condvar,
+}
+
+struct ThreadPermit {
+    limiter: Arc<ThreadLimiter>,
+    is_wait: bool,
+}
+
+impl ThreadLimiter {
+    fn acquire(self: &Arc<Self>, is_wait: bool) -> Option<ThreadPermit> {
+        let mut guard = self.counts.lock().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_millis(30);
+        loop {
+            let can_take = guard.total_threads < MAX_TOTAL_HTTP_THREADS
+                && (!is_wait || guard.wait_threads < MAX_WAIT_HTTP_THREADS);
+            if can_take {
+                guard.total_threads += 1;
+                if is_wait {
+                    guard.wait_threads += 1;
+                }
+                return Some(ThreadPermit {
+                    limiter: self.clone(),
+                    is_wait,
+                });
+            }
+            let Some(rem) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return None;
+            };
+            if rem.is_zero() {
+                return None;
+            }
+            let (next_guard, res) = self.cv.wait_timeout(guard, rem).unwrap();
+            guard = next_guard;
+            if res.timed_out() {
+                return None;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn active_total(&self) -> usize {
+        self.counts.lock().unwrap().total_threads
+    }
+}
+
+impl Drop for ThreadPermit {
+    fn drop(&mut self) {
+        let mut guard = self.limiter.counts.lock().unwrap();
+        guard.total_threads = guard.total_threads.saturating_sub(1);
+        if self.is_wait {
+            guard.wait_threads = guard.wait_threads.saturating_sub(1);
+        }
+        self.limiter.cv.notify_all();
+    }
+}
+
+impl Request {
+    fn is_rex_wait(&self) -> bool {
+        matches!(&self.route, Route::Rex { path, .. } if path == "/rex/wait")
+    }
 }
 
 pub struct Http {
@@ -145,6 +233,9 @@ pub struct Http {
     unit: String,
     notify: Arc<Notify>,
     device: Option<Device>,
+    rex: Option<Arc<RexZeroEngine>>,
+    ui_wake: Option<(Arc<AtomicU64>, Waker)>,
+    limiter: Arc<ThreadLimiter>,
     state: Mutex<State>,
 }
 
@@ -155,8 +246,21 @@ impl Http {
             unit,
             notify,
             device,
+            rex: None,
+            ui_wake: None,
+            limiter: Arc::default(),
             state: Mutex::default(),
         }
+    }
+
+    pub fn with_rex(mut self, rex: Arc<RexZeroEngine>) -> Self {
+        self.rex = Some(rex);
+        self
+    }
+
+    pub fn with_ui_waker(mut self, seq: Arc<AtomicU64>, waker: Waker) -> Self {
+        self.ui_wake = Some((seq, waker));
+        self
     }
 
     /// Owner task: emit queued facts until the core's event slots are full.
@@ -266,6 +370,25 @@ impl Http {
         }
         drop(state);
         self.notify.wake();
+        if let Some((seq, waker)) = &self.ui_wake {
+            seq.fetch_add(1, Ordering::Release);
+            waker.wake();
+        }
+    }
+
+    fn release_wait_slot(&self, handle: u32) {
+        let mut state = self.state.lock().unwrap();
+        let State {
+            resources,
+            live_wait_resources,
+            ..
+        } = &mut *state;
+        if let Some(res) = resources.get_mut(&handle) {
+            if res.wait_slot_active {
+                res.wait_slot_active = false;
+                *live_wait_resources = live_wait_resources.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -305,6 +428,8 @@ unsafe extern "C" fn open(
             request,
             started: None,
             cancelled: false,
+            cancel_token: Arc::new(AtomicBool::new(false)),
+            wait_slot_active: false,
             delivered: 0,
         },
     );
@@ -322,35 +447,85 @@ unsafe extern "C" fn start(
     _: usize,
 ) -> i32 {
     let http = &*(context as *const Http);
-    let job = {
+    let (job, cancel_token, wait_over_cap) = {
         let mut state = http.state.lock().unwrap();
-        let Some(resource) = state.resources.get_mut(&handle) else {
+        let State {
+            resources,
+            live_wait_resources,
+            ..
+        } = &mut *state;
+        let Some(resource) = resources.get_mut(&handle) else {
             return INVALID;
         };
         if opcode != 1 || length != 0 || resource.started.is_some() {
             return INVALID;
-        }
+        };
         resource.started = Some(request);
-        resource.request.clone()
+        let is_wait = resource.request.is_rex_wait();
+        let over_cap = is_wait && *live_wait_resources >= MAX_LIVE_WAIT_RESOURCES;
+        if is_wait && !over_cap {
+            *live_wait_resources += 1;
+            resource.wait_slot_active = true;
+        }
+        (
+            resource.request.clone(),
+            resource.cancel_token.clone(),
+            over_cap,
+        )
     };
     if matches!(job.route, Route::Quit) {
         QUIT.store(true, Ordering::Relaxed);
         http.answer(handle, request, Ok(no_content()), &job.url);
         return OK;
     }
+    if wait_over_cap {
+        // Reserve >= 6 worker handles and >= 8 threads for interactive actions (`/rex/action`, `/dev/*`).
+        http.answer(
+            handle,
+            request,
+            Ok(gateway(
+                429,
+                "wait capacity reserved for interactive actions".into(),
+            )),
+            &job.url,
+        );
+        return OK;
+    }
+    let is_wait = job.is_rex_wait();
+    let Some(permit) = http.limiter.acquire(is_wait) else {
+        let mut state = http.state.lock().unwrap();
+        let State {
+            resources,
+            live_wait_resources,
+            ..
+        } = &mut *state;
+        if let Some(res) = resources.get_mut(&handle) {
+            res.started = None;
+            if res.wait_slot_active {
+                res.wait_slot_active = false;
+                *live_wait_resources = live_wait_resources.saturating_sub(1);
+            }
+        }
+        return BUSY;
+    };
     // The context is the Arc driver() was given; each thread holds its own.
     Arc::increment_strong_count(context as *const Http);
     let owned = Arc::from_raw(context as *const Http);
     let spawned = std::thread::Builder::new()
         .name("pocket-http".into())
-        .stack_size(64 * 1024)
+        .stack_size(512 * 1024)
         .spawn(move || {
-            let answer = perform(&job, &owned);
+            let _permit = permit;
+            let answer = perform(&job, &cancel_token, &owned);
+            if is_wait {
+                owned.release_wait_slot(handle);
+            }
             owned.answer(handle, request, answer, &job.url);
         });
     if spawned.is_ok() {
         OK
     } else {
+        http.release_wait_slot(handle);
         FAILED
     }
 }
@@ -359,24 +534,63 @@ unsafe extern "C" fn start(
 /// stopped, and the thread's answer is dropped.
 unsafe extern "C" fn cancel(context: *mut c_void, core: *mut Core, handle: u32, request: u32) {
     let http = &*(context as *const Http);
-    let mut state = http.state.lock().unwrap();
-    let Some(resource) = state.resources.get_mut(&handle) else {
-        return;
+    let mut wake_rex = false;
+    let delivered = {
+        let mut state = http.state.lock().unwrap();
+        let State {
+            resources,
+            facts,
+            live_wait_resources,
+        } = &mut *state;
+        let Some(resource) = resources.get_mut(&handle) else {
+            return;
+        };
+        if resource.started != Some(request) || resource.cancelled {
+            return;
+        };
+        resource.cancelled = true;
+        resource.cancel_token.store(true, Ordering::SeqCst);
+        if resource.wait_slot_active {
+            resource.wait_slot_active = false;
+            *live_wait_resources = live_wait_resources.saturating_sub(1);
+            wake_rex = true;
+        } else if resource.request.is_rex_wait() {
+            wake_rex = true;
+        }
+        let d = resource.delivered;
+        facts.retain(|fact| fact.handle() != handle);
+        d
     };
-    if resource.started != Some(request) || resource.cancelled {
-        return;
+    if wake_rex {
+        if let Some(rex) = &http.rex {
+            rex.wake_waiters();
+        }
     }
-    resource.cancelled = true;
-    let delivered = resource.delivered;
-    state.facts.retain(|fact| fact.handle() != handle);
     pocket_worker_finish(core, handle, request, UNKNOWN, delivered);
 }
 
 unsafe extern "C" fn close(context: *mut c_void, _: *mut Core, handle: u32) -> i32 {
     let http = &*(context as *const Http);
-    let mut state = http.state.lock().unwrap();
-    state.resources.remove(&handle);
-    state.facts.retain(|fact| fact.handle() != handle);
+    let wake_rex = {
+        let mut state = http.state.lock().unwrap();
+        let mut should_wake = false;
+        if let Some(res) = state.resources.remove(&handle) {
+            res.cancel_token.store(true, Ordering::SeqCst);
+            if res.wait_slot_active {
+                state.live_wait_resources = state.live_wait_resources.saturating_sub(1);
+                should_wake = true;
+            } else if res.request.is_rex_wait() {
+                should_wake = true;
+            }
+        }
+        state.facts.retain(|fact| fact.handle() != handle);
+        should_wake
+    };
+    if wake_rex {
+        if let Some(rex) = &http.rex {
+            rex.wake_waiters();
+        }
+    }
     OK
 }
 
@@ -460,6 +674,13 @@ fn route(url: &str) -> Option<Route> {
         let path = path.split('?').next().unwrap_or(path);
         return Some(Route::Device { path: path.into() });
     }
+    if authority == "zero" && (path == "/rex" || path.starts_with("/rex/")) {
+        let (clean_path, query) = path.split_once('?').unwrap_or((path, ""));
+        return Some(Route::Rex {
+            path: clean_path.into(),
+            query: query.into(),
+        });
+    }
     let (name, port) = authority.rsplit_once(':')?;
     if name != "127.0.0.1" && name != "localhost" {
         return None;
@@ -471,7 +692,17 @@ fn route(url: &str) -> Option<Route> {
     })
 }
 
-fn perform(request: &Request, http: &Http) -> Result<Response, Failure> {
+fn perform(
+    request: &Request,
+    cancel_token: &AtomicBool,
+    http: &Http,
+) -> Result<Response, Failure> {
+    if cancel_token.load(Ordering::Acquire) {
+        return Err(Failure {
+            reached: false,
+            message: "request cancelled".into(),
+        });
+    }
     let (control, unit) = (&http.control, http.unit.as_str());
     match &request.route {
         Route::Quit => Ok(no_content()),
@@ -490,6 +721,36 @@ fn perform(request: &Request, http: &Http) -> Result<Response, Failure> {
             Ok(Response {
                 status: answer.status,
                 headers: BTreeMap::from([("content-type".into(), answer.content_type.into())]),
+                body: answer.body,
+            })
+        }
+        Route::Rex { path, query } => {
+            let Some(rex) = &http.rex else {
+                return Ok(gateway(503, "this program runs no Rex engine".into()));
+            };
+            let answer = rex.handle_http_with_context(
+                &request.method,
+                path,
+                query,
+                &request.body,
+                request.timeout,
+                cancel_token,
+            );
+            if cancel_token.load(Ordering::Acquire) {
+                return Err(Failure {
+                    reached: false,
+                    message: "request cancelled".into(),
+                });
+            }
+            if answer.body.len() > request.max_bytes {
+                return Err(Failure {
+                    reached: true,
+                    message: "the response is over maxBytes".into(),
+                });
+            }
+            Ok(Response {
+                status: answer.status,
+                headers: BTreeMap::from([("content-type".into(), "application/json".into())]),
                 body: answer.body,
             })
         }
@@ -693,6 +954,7 @@ mod tests {
         assert!(matches!(route("http://companion/status"), Some(Route::Companion { path }) if path == "/status"));
         // The device API drops the query: the device layer routes on the path.
         assert!(matches!(route("http://zero/dev/motion?t=3"), Some(Route::Device { path }) if path == "/dev/motion"));
+        assert!(matches!(route("http://zero/rex/wait?since=4&timeout_ms=9000"), Some(Route::Rex { path, query }) if path == "/rex/wait" && query == "since=4&timeout_ms=9000"));
         assert!(matches!(route("http://127.0.0.1:8080/x"), Some(Route::Loopback { port: 8080, .. })));
         assert!(matches!(route("http://localhost:9/"), Some(Route::Loopback { port: 9, .. })));
         for refused in ["http://zero/other", "http://example.com/", "https://companion/status", "http://10.0.0.1:80/", "http://zero/dev/a b"] {
@@ -715,15 +977,114 @@ mod tests {
     fn the_device_api_answers_in_process() {
         let dir = std::env::temp_dir().join(format!("pocket-zero-http-{}", std::process::id()));
         let device = Device::new(dir.clone(), true, "default".into());
-        let http = Http::new(PathBuf::from("/nonexistent/control.json"), COMPANION_UNIT.into(), Arc::default(), Some(device));
+        let http = Http::new(
+            PathBuf::from("/nonexistent/control.json"),
+            COMPANION_UNIT.into(),
+            Arc::default(),
+            Some(device),
+        );
+        let cancel_flag = AtomicBool::new(false);
         let request = parse(&descriptor("http://zero/dev/capabilities")).unwrap();
-        let response = perform(&request, &http).ok().unwrap();
+        let response = perform(&request, &cancel_flag, &http).ok().unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.headers["content-type"], "application/json");
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["mock"], true);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["mock"],
+            true
+        );
         // Without a companion, its host answers as a gateway.
-        let companion = perform(&parse(&descriptor("http://companion/status")).unwrap(), &http).ok().unwrap();
+        let companion = perform(
+            &parse(&descriptor("http://companion/status")).unwrap(),
+            &cancel_flag,
+            &http,
+        )
+        .ok()
+        .unwrap();
         assert_eq!(companion.status, 503);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rex_wait_honors_http_deadline_cancels_on_close_and_reserves_action_capacity() {
+        let rex = Arc::new(RexZeroEngine::new_mock(None));
+        let http = Arc::new(
+            Http::new(
+                PathBuf::from("/nonexistent/control.json"),
+                COMPANION_UNIT.into(),
+                Arc::default(),
+                None,
+            )
+            .with_rex(rex.clone()),
+        );
+        let drv = driver(&http);
+        let cur_rev = rex.snapshot().revision;
+
+        // 1. Short HTTP `timeoutMs` (80ms) caps `/rex/wait` (`timeout_ms=25000`)!
+        let short_desc = serde_json::to_vec(&serde_json::json!({
+            "url": format!("http://zero/rex/wait?since={cur_rev}&timeout_ms=25000"),
+            "method": "GET",
+            "timeoutMs": 80
+        }))
+        .unwrap();
+        let req_short = parse(&short_desc).unwrap();
+        let t0 = std::time::Instant::now();
+        let resp = perform(&req_short, &AtomicBool::new(false), &http).ok().unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(t0.elapsed() < Duration::from_millis(400));
+
+        // 2. Closing 20 churned `/rex/wait` resources cancels their threads immediately so threads never accumulate!
+        let wait_desc = serde_json::to_vec(&serde_json::json!({
+            "url": format!("http://zero/rex/wait?since={cur_rev}&timeout_ms=25000"),
+            "method": "GET"
+        }))
+        .unwrap();
+        for h in 1..=20u32 {
+            assert_eq!(
+                unsafe { (drv.open.unwrap())(drv.context, std::ptr::null_mut(), h, wait_desc.as_ptr(), wait_desc.len()) },
+                OK
+            );
+            assert_eq!(
+                unsafe { (drv.start.unwrap())(drv.context, std::ptr::null_mut(), h, 1, 1, std::ptr::null(), 0, 0) },
+                OK
+            );
+            assert_eq!(
+                unsafe { (drv.close.unwrap())(drv.context, std::ptr::null_mut(), h) },
+                OK
+            );
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(http.limiter.active_total(), 0);
+
+        // 3. Even with 8 simultaneous `/rex/wait` attempts open, excess waits finish immediately with 429
+        // and interactive `POST /rex/action` succeeds without starvation!
+        for h in 100..108u32 {
+            assert_eq!(
+                unsafe { (drv.open.unwrap())(drv.context, std::ptr::null_mut(), h, wait_desc.as_ptr(), wait_desc.len()) },
+                OK
+            );
+            assert_eq!(
+                unsafe { (drv.start.unwrap())(drv.context, std::ptr::null_mut(), h, 1, 1, std::ptr::null(), 0, 0) },
+                OK
+            );
+        }
+        let action_desc = serde_json::to_vec(&serde_json::json!({
+            "url": "http://zero/rex/action",
+            "method": "POST",
+            "body": r#"{"op":"toggle_mute"}"#
+        }))
+        .unwrap();
+        assert_eq!(
+            unsafe { (drv.open.unwrap())(drv.context, std::ptr::null_mut(), 200, action_desc.as_ptr(), action_desc.len()) },
+            OK
+        );
+        assert_eq!(
+            unsafe { (drv.start.unwrap())(drv.context, std::ptr::null_mut(), 200, 1, 1, std::ptr::null(), 0, 0) },
+            OK
+        );
+        for h in (100..108u32).chain(std::iter::once(200)) {
+            let _ = unsafe { (drv.close.unwrap())(drv.context, std::ptr::null_mut(), h) };
+        }
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(http.limiter.active_total(), 0);
     }
 }

@@ -395,6 +395,13 @@ pub struct PaintCache {
     /// a disc slot (JS misuse), which simply goes stale here and re-bakes.
     entries: Vec<(u32, i32)>,
     glyphs: Vec<GlyphPage>,
+    /// Superseded glyph-page textures still referenced by the current primary
+    /// draw list, auxiliary draw list, or an external `prepare_glyph_page`
+    /// consumer. Freed once every referencing consumer advances.
+    retired_glyphs: Vec<RetiredGlyphPage>,
+    primary_seq: u64,
+    aux_seq: u64,
+    external_epoch: u64,
     borders: Vec<([u32; 4], i32)>,
     layouts: BTreeMap<u32, CachedTextLayout>,
 }
@@ -412,14 +419,157 @@ struct CachedTextLayout {
 
 struct GlyphPage {
     slot: u8,
+    base_revision: u64,
     revision: u64,
     page: u32,
     handle: i32,
+    created_by: GlyphPageUse,
+    created_seq: u64,
+    primary_seq: u64,
+    aux_seq: u64,
+    external_epoch: u64,
+}
+
+struct RetiredGlyphPage {
+    handle: i32,
+    primary_seq: u64,
+    aux_seq: u64,
+    external_epoch: u64,
+}
+
+/// Which output root (or external consumer) is acquiring a glyph page handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlyphPageUse {
+    Primary,
+    Auxiliary,
+    External,
+}
+
+impl GlyphPageUse {
+    #[inline]
+    fn from_root(root: crate::text::DrawRoot) -> Self {
+        match root {
+            crate::text::DrawRoot::Primary => Self::Primary,
+            crate::text::DrawRoot::Auxiliary => Self::Auxiliary,
+        }
+    }
 }
 
 impl PaintCache {
     pub const fn new() -> PaintCache {
-        PaintCache { entries: Vec::new(), glyphs: Vec::new(), borders: Vec::new(), layouts: BTreeMap::new() }
+        PaintCache {
+            entries: Vec::new(),
+            glyphs: Vec::new(),
+            retired_glyphs: Vec::new(),
+            primary_seq: 0,
+            aux_seq: 0,
+            external_epoch: 1,
+            borders: Vec::new(),
+            layouts: BTreeMap::new(),
+        }
+    }
+
+    #[inline]
+    fn is_seq_live(
+        page_primary: u64,
+        page_aux: u64,
+        page_external: u64,
+        cur_primary: u64,
+        cur_aux: u64,
+        cur_external: u64,
+    ) -> bool {
+        (cur_primary != 0 && page_primary == cur_primary)
+            || (cur_aux != 0 && page_aux == cur_aux)
+            || (cur_external != 0 && page_external == cur_external)
+    }
+
+    fn advance_external_epoch(&mut self) {
+        self.external_epoch = self.external_epoch.wrapping_add(1);
+        if self.external_epoch == 0 {
+            self.external_epoch = 1;
+            for g in &mut self.glyphs {
+                g.external_epoch = 0;
+            }
+            for r in &mut self.retired_glyphs {
+                r.external_epoch = 0;
+            }
+        }
+    }
+
+    pub(crate) fn release_external_glyph_pages(
+        &mut self,
+        textures: &mut [crate::TexSlot],
+        free: &mut Vec<u32>,
+    ) {
+        self.advance_external_epoch();
+        self.reap_retired_glyphs(textures, free);
+    }
+
+    fn begin_draw_root(
+        &mut self,
+        root: crate::text::DrawRoot,
+        textures: &mut [crate::TexSlot],
+        free: &mut Vec<u32>,
+    ) {
+        match root {
+            crate::text::DrawRoot::Primary => {
+                self.primary_seq = self.primary_seq.wrapping_add(1);
+                if self.primary_seq == 0 {
+                    self.primary_seq = 1;
+                    for g in &mut self.glyphs {
+                        g.primary_seq = 0;
+                        if g.created_by == GlyphPageUse::Primary {
+                            g.created_seq = 0;
+                        }
+                    }
+                    for r in &mut self.retired_glyphs {
+                        r.primary_seq = 0;
+                    }
+                }
+                self.advance_external_epoch();
+            }
+            crate::text::DrawRoot::Auxiliary => {
+                self.aux_seq = self.aux_seq.wrapping_add(1);
+                if self.aux_seq == 0 {
+                    self.aux_seq = 1;
+                    for g in &mut self.glyphs {
+                        g.aux_seq = 0;
+                        if g.created_by == GlyphPageUse::Auxiliary {
+                            g.created_seq = 0;
+                        }
+                    }
+                    for r in &mut self.retired_glyphs {
+                        r.aux_seq = 0;
+                    }
+                }
+            }
+        }
+        self.reap_retired_glyphs(textures, free);
+    }
+
+    fn reap_retired_glyphs(&mut self, textures: &mut [crate::TexSlot], free: &mut Vec<u32>) {
+        let cur_primary = self.primary_seq;
+        let cur_aux = self.aux_seq;
+        let cur_external = self.external_epoch;
+        self.retired_glyphs.retain(|retired| {
+            if Self::is_seq_live(
+                retired.primary_seq,
+                retired.aux_seq,
+                retired.external_epoch,
+                cur_primary,
+                cur_aux,
+                cur_external,
+            ) {
+                return true;
+            }
+            if let Some(index) = crate::tex_resolve(textures, retired.handle) {
+                let slot = &mut textures[index as usize];
+                slot.vacate();
+                slot.gen = ((slot.gen as u32 + 1) & crate::TEX_GEN_MASK) as u16;
+                free.push(index);
+            }
+            false
+        });
     }
 
     #[cfg(test)]
@@ -443,6 +593,52 @@ impl GlyphPageLayout {
     }
 }
 
+/// Whether `entry` was created exclusively for the currently executing draw
+/// pass on the same non-streamed atlas structure (with no other consumer and
+/// no in-flight zero-copy GPU fence). Within one draw pass, every dynamic cell
+/// referenced by earlier quads is pinned to the current batch, so newly filled
+/// dynamic cells cannot alter any earlier quad's pixels and the page texture
+/// can be refreshed in place instead of allocating a new full page per glyph.
+#[allow(clippy::too_many_arguments)]
+fn can_update_page_in_place(
+    entry: &GlyphPage,
+    atlas: &crate::text::Atlas,
+    base_revision: u64,
+    usage: GlyphPageUse,
+    cur_primary: u64,
+    cur_aux: u64,
+    cur_external: u64,
+    textures: &[crate::TexSlot],
+) -> bool {
+    if atlas.stream.is_some() || entry.base_revision != base_revision {
+        return false;
+    }
+    let same_pass_exclusive = match usage {
+        GlyphPageUse::Primary => {
+            cur_primary != 0
+                && entry.created_by == GlyphPageUse::Primary
+                && entry.created_seq == cur_primary
+                && !(cur_aux != 0 && entry.aux_seq == cur_aux)
+                && !(cur_external != 0 && entry.external_epoch == cur_external)
+        }
+        GlyphPageUse::Auxiliary => {
+            cur_aux != 0
+                && entry.created_by == GlyphPageUse::Auxiliary
+                && entry.created_seq == cur_aux
+                && !(cur_primary != 0 && entry.primary_seq == cur_primary)
+                && !(cur_external != 0 && entry.external_epoch == cur_external)
+        }
+        GlyphPageUse::External => false,
+    };
+    if !same_pass_exclusive {
+        return false;
+    }
+    let Some(index) = crate::tex_resolve(textures, entry.handle) else {
+        return false;
+    };
+    textures[index as usize].fence == 0
+}
+
 /// Coverage pages for transformed text use the existing portable TEX_QUAD
 /// contract. T8 keeps one byte per sample; the palette supplies white RGB and
 /// coverage alpha, so text color remains a per-quad tint. Pages are shared by
@@ -453,19 +649,57 @@ pub(crate) fn glyph_page(
     textures: &mut Vec<crate::TexSlot>,
     free: &mut Vec<u32>,
     atlas: &crate::text::Atlas,
-    revision: u64,
+    base_revision: u64,
     gid: u16,
+    usage: GlyphPageUse,
 ) -> Option<GlyphSampler> {
+    let revision = atlas.content_revision(base_revision);
     let layout = GlyphPageLayout::new(atlas, gid)?;
     let page = layout.page();
     let width = layout.width();
     let height = layout.height();
-    // A load/stream update invalidates every page of that font. Release the
-    // old generation before allocating its replacement; stale handles cannot
-    // alias a new texture even if the free-list reuses the same slot.
+    let cur_primary = cache.primary_seq;
+    let cur_aux = cache.aux_seq;
+    let cur_external = cache.external_epoch;
+    // A load/stream/dynamic update invalidates stale pages of that font,
+    // except pages created exclusively by the current draw pass on the same
+    // non-streamed atlas (which are refreshed in place below). Pages still
+    // referenced by an active primary, auxiliary, or external consumer stay
+    // alive in `retired_glyphs` until every referencing consumer advances.
+    let retired = &mut cache.retired_glyphs;
     cache.glyphs.retain(|entry| {
-        if entry.slot != atlas.slot || entry.revision == revision { return true; }
-        if let Some(index) = crate::tex_resolve(textures, entry.handle) {
+        if entry.slot != atlas.slot || entry.revision == revision {
+            return true;
+        }
+        if can_update_page_in_place(
+            entry,
+            atlas,
+            base_revision,
+            usage,
+            cur_primary,
+            cur_aux,
+            cur_external,
+            textures,
+        ) {
+            return true;
+        }
+        if PaintCache::is_seq_live(
+            entry.primary_seq,
+            entry.aux_seq,
+            entry.external_epoch,
+            cur_primary,
+            cur_aux,
+            cur_external,
+        ) {
+            if crate::tex_resolve(textures, entry.handle).is_some() {
+                retired.push(RetiredGlyphPage {
+                    handle: entry.handle,
+                    primary_seq: entry.primary_seq,
+                    aux_seq: entry.aux_seq,
+                    external_epoch: entry.external_epoch,
+                });
+            }
+        } else if let Some(index) = crate::tex_resolve(textures, entry.handle) {
             let slot = &mut textures[index as usize];
             slot.vacate();
             slot.gen = ((slot.gen as u32 + 1) & crate::TEX_GEN_MASK) as u16;
@@ -473,27 +707,140 @@ pub(crate) fn glyph_page(
         }
         false
     });
-    let cached = cache.glyphs.iter().position(|e| e.slot == atlas.slot && e.page == page);
-    let entry = if let Some(i) = cached.filter(|&i| crate::tex_resolve(textures, cache.glyphs[i].handle).is_some()) {
-        &cache.glyphs[i]
+    let mut cached = cache
+        .glyphs
+        .iter()
+        .position(|e| e.slot == atlas.slot && e.page == page);
+    let mut reused_handle: Option<i32> = None;
+    if let Some(i) = cached {
+        let entry_handle = cache.glyphs[i].handle;
+        if let Some(index) = crate::tex_resolve(textures, entry_handle) {
+            if cache.glyphs[i].revision == revision {
+                let entry = &mut cache.glyphs[i];
+                match usage {
+                    GlyphPageUse::Primary => entry.primary_seq = cur_primary,
+                    GlyphPageUse::Auxiliary => entry.aux_seq = cur_aux,
+                    GlyphPageUse::External => entry.external_epoch = cur_external,
+                }
+                reused_handle = Some(entry.handle);
+            } else {
+                let byte_len = (width * height) as usize;
+                let can_overwrite = can_update_page_in_place(
+                    &cache.glyphs[i],
+                    atlas,
+                    base_revision,
+                    usage,
+                    cur_primary,
+                    cur_aux,
+                    cur_external,
+                    textures,
+                ) && textures[index as usize].tex.as_ref().is_some_and(|tex| {
+                    tex.w == width
+                        && tex.h == height
+                        && tex.byte_len == byte_len
+                        && tex.psm == spec::psm::PSM_T8
+                });
+                if can_overwrite {
+                    let tex = textures[index as usize].tex.as_mut().unwrap();
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts_mut(tex.data.as_mut_ptr() as *mut u8, byte_len)
+                    };
+                    bytes.fill(0);
+                    if !layout.expand_a8(crate::font_pages::view(atlas), bytes) {
+                        return None;
+                    }
+                    tex.revision = tex.revision.wrapping_add(1);
+                    let entry = &mut cache.glyphs[i];
+                    entry.revision = revision;
+                    match usage {
+                        GlyphPageUse::Primary => entry.primary_seq = cur_primary,
+                        GlyphPageUse::Auxiliary => entry.aux_seq = cur_aux,
+                        GlyphPageUse::External => entry.external_epoch = cur_external,
+                    }
+                    reused_handle = Some(entry.handle);
+                } else {
+                    let entry = cache.glyphs.swap_remove(i);
+                    cached = None;
+                    if PaintCache::is_seq_live(
+                        entry.primary_seq,
+                        entry.aux_seq,
+                        entry.external_epoch,
+                        cur_primary,
+                        cur_aux,
+                        cur_external,
+                    ) {
+                        cache.retired_glyphs.push(RetiredGlyphPage {
+                            handle: entry.handle,
+                            primary_seq: entry.primary_seq,
+                            aux_seq: entry.aux_seq,
+                            external_epoch: entry.external_epoch,
+                        });
+                    } else {
+                        let slot = &mut textures[index as usize];
+                        slot.vacate();
+                        slot.gen = ((slot.gen as u32 + 1) & crate::TEX_GEN_MASK) as u16;
+                        free.push(index);
+                    }
+                }
+            }
+        }
+    }
+    let handle = if let Some(handle) = reused_handle {
+        handle
     } else {
-        if let Some(i) = cached { cache.glyphs.swap_remove(i); }
+        if let Some(i) = cached {
+            cache.glyphs.swap_remove(i);
+        }
         let byte_len = (width * height) as usize;
         let mut data = alloc::vec![0u128; byte_len.div_ceil(16)];
-        let bytes = unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, byte_len) };
-        if !layout.expand_a8(crate::font_pages::view(atlas), bytes) { return None; }
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, byte_len) };
+        if !layout.expand_a8(crate::font_pages::view(atlas), bytes) {
+            return None;
+        }
         let mut palette = alloc::vec![0u128; 64];
-        let colors = unsafe { core::slice::from_raw_parts_mut(palette.as_mut_ptr() as *mut u32, 256) };
-        for (a, color) in colors.iter_mut().enumerate() { *color = 0x00ff_ffff | ((a as u32) << 24); }
-        let handle = crate::tex_alloc(textures, free, crate::Texture {
-            data, byte_len, w: width, h: height, psm: spec::psm::PSM_T8,
-            palette: Some(palette), linear: true, revision: 0,
+        let colors =
+            unsafe { core::slice::from_raw_parts_mut(palette.as_mut_ptr() as *mut u32, 256) };
+        for (a, color) in colors.iter_mut().enumerate() {
+            *color = 0x00ff_ffff | ((a as u32) << 24);
+        }
+        let handle = crate::tex_alloc(
+            textures,
+            free,
+            crate::Texture {
+                data,
+                byte_len,
+                w: width,
+                h: height,
+                psm: spec::psm::PSM_T8,
+                palette: Some(palette),
+                linear: true,
+                revision: 0,
+            },
+        );
+        if handle < 0 {
+            return None;
+        }
+        let (created_seq, primary_seq, aux_seq, external_epoch) = match usage {
+            GlyphPageUse::Primary => (cur_primary, cur_primary, 0, 0),
+            GlyphPageUse::Auxiliary => (cur_aux, 0, cur_aux, 0),
+            GlyphPageUse::External => (cur_external, 0, 0, cur_external),
+        };
+        cache.glyphs.push(GlyphPage {
+            slot: atlas.slot,
+            base_revision,
+            revision,
+            page,
+            handle,
+            created_by: usage,
+            created_seq,
+            primary_seq,
+            aux_seq,
+            external_epoch,
         });
-        if handle < 0 { return None; }
-        cache.glyphs.push(GlyphPage { slot: atlas.slot, revision, page, handle });
-        cache.glyphs.last()?
+        handle
     };
-    Some(layout.sampler(entry.handle as u32))
+    Some(layout.sampler(handle as u32))
 }
 
 impl Default for PaintCache {
@@ -922,8 +1269,9 @@ fn hit_walk(
 struct Walker<'a> {
     tree: &'a Tree,
     styles: &'a StyleTable,
-    fonts: &'a Fonts,
+    fonts: &'a mut Fonts,
     font_revisions: &'a [u64; spec::MAX_FONT_SLOTS],
+    draw_root: crate::text::DrawRoot,
     /// Global vblank counter — drives deterministic sprite frame selection.
     frame: u64,
     /// Viewport bounds in px — every emitted coordinate is clipped to
@@ -965,7 +1313,7 @@ struct Walker<'a> {
 pub fn build(
     tree: &Tree,
     styles: &StyleTable,
-    fonts: &Fonts,
+    fonts: &mut Fonts,
     font_revisions: &[u64; spec::MAX_FONT_SLOTS],
     frame: u64,
     screen: (f32, f32),
@@ -1003,7 +1351,7 @@ pub fn build(
 pub fn build_root(
     tree: &Tree,
     styles: &StyleTable,
-    fonts: &Fonts,
+    fonts: &mut Fonts,
     font_revisions: &[u64; spec::MAX_FONT_SLOTS],
     frame: u64,
     root_id: i32,
@@ -1018,6 +1366,13 @@ pub fn build_root(
     cursor: Option<(u32, f32, f32, f32, f32)>,
 ) -> (Option<(f32, f32, f32, f32)>, Option<(f32, f32, f32, f32)>, bool) {
     dl.words.clear();
+    let draw_root = if root_id == spec::ROOT_ID {
+        crate::text::DrawRoot::Primary
+    } else {
+        crate::text::DrawRoot::Auxiliary
+    };
+    fonts.begin_draw_batch_for(draw_root);
+    paint_cache.begin_draw_root(draw_root, textures, tex_free);
     // DevTools (docs/DEVTOOLS.md): slot of the inspected node, u32::MAX = none.
     // Nodes inside a perspective subtree take the paint_3d path and are not
     // captured (only the 2D walk composes a world Affine per node).
@@ -1031,6 +1386,7 @@ pub fn build_root(
         styles,
         fonts,
         font_revisions,
+        draw_root,
         frame,
         screen,
         glyph_scratch: Vec::new(),
@@ -2635,6 +2991,58 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// Compute the clipped axis-aligned screen quad for `emit_tex_quad`,
+    /// returning `None` when the clipped extent is empty or rounds to zero
+    /// destination pixels in either dimension.
+    #[inline]
+    fn clip_axis_aligned_quad(
+        world: &Affine,
+        w: f32,
+        h: f32,
+        clip: &Clip,
+    ) -> Option<(f32, f32, f32, f32, Clip)> {
+        let (sx0, sy0) = world.apply(0.0, 0.0);
+        let (sx1, sy1) = world.apply(w, h);
+        if sx1 <= sx0 || sy1 <= sy0 {
+            return None;
+        }
+        let c = Clip {
+            x0: sx0.max(clip.x0),
+            y0: sy0.max(clip.y0),
+            x1: sx1.min(clip.x1),
+            y1: sy1.min(clip.y1),
+        };
+        if c.is_empty() || roundf(c.x1 - c.x0) <= 0.0 || roundf(c.y1 - c.y0) <= 0.0 {
+            return None;
+        }
+        Some((sx0, sy0, sx1, sy1, c))
+    }
+
+    /// Whether the packed integer destination rectangle emitted by
+    /// `emit_tex_quad` (clipped against `glyph_clip` for UV stability) has a
+    /// non-empty intersection with the active integer `SCISSOR` box (`scissor`).
+    #[inline]
+    fn scaled_quad_intersects_scissor(
+        world: &Affine,
+        w: f32,
+        h: f32,
+        glyph_clip: &Clip,
+        scissor: &Clip,
+    ) -> bool {
+        let Some((_, _, _, _, c)) = Self::clip_axis_aligned_quad(world, w, h, glyph_clip) else {
+            return false;
+        };
+        let rx0 = roundf(c.x0) as i32;
+        let ry0 = roundf(c.y0) as i32;
+        let rx1 = rx0 + roundf(c.x1 - c.x0) as i32;
+        let ry1 = ry0 + roundf(c.y1 - c.y0) as i32;
+        let sx0 = roundf(scissor.x0) as i32;
+        let sy0 = roundf(scissor.y0) as i32;
+        let sx1 = sx0 + roundf(scissor.x1 - scissor.x0) as i32;
+        let sy1 = sy0 + roundf(scissor.y1 - scissor.y0) as i32;
+        rx1 > sx0 && rx0 < sx1 && ry1 > sy0 && ry0 < sy1
+    }
+
     /// Emit an image TEX_QUAD (axis-aligned only; rotated images are
     /// conservatively culled — no textured-triangle op in the DrawList v1).
     #[allow(clippy::too_many_arguments)]
@@ -2670,20 +3078,9 @@ impl<'a> Walker<'a> {
             clip_fan(&poly, clip, |a, b, c| emit_tex_tri(dl, tex, modulate, a, b, c, clip, self.screen));
             return;
         }
-        let (sx0, sy0) = world.apply(0.0, 0.0);
-        let (sx1, sy1) = world.apply(w, h);
-        if sx1 <= sx0 || sy1 <= sy0 {
+        let Some((sx0, sy0, sx1, sy1, c)) = Self::clip_axis_aligned_quad(world, w, h, clip) else {
             return;
-        }
-        let c = Clip {
-            x0: sx0.max(clip.x0),
-            y0: sy0.max(clip.y0),
-            x1: sx1.min(clip.x1),
-            y1: sy1.min(clip.y1),
         };
-        if c.is_empty() || roundf(c.x1 - c.x0) <= 0.0 || roundf(c.y1 - c.y0) <= 0.0 {
-            return;
-        }
         // UV re-interpolation over the clipped span, remapped into the frame's
         // atlas sub-rect [fu0,fu1] x [fv0,fv1] (the whole texture for images).
         let du = fu1 - fu0;
@@ -2801,25 +3198,108 @@ impl<'a> Walker<'a> {
             self.emit_text_native(dl, run, r, world, color, clip, box_w);
             return;
         }
-        let Some(atlas) = self.fonts.atlas(slot) else { return };
-        let (cell_w, cell_h) = (atlas.cell_w as f32, atlas.cell_h as f32);
+        let (cell_w, cell_h, has_stream, has_dyn, content_rev) = {
+            let Some(atlas) = self.fonts.atlas(slot) else { return };
+            (
+                atlas.cell_w as f32,
+                atlas.cell_h as f32,
+                atlas.stream.is_some(),
+                atlas.has_dynamic_cache(),
+                atlas.content_revision(self.font_revisions[slot as usize]),
+            )
+        };
+        let scaled_axis_aligned = world.is_axis_aligned() && (world.a != 1.0 || world.d != 1.0);
         let mut scratch = core::mem::take(&mut self.glyph_scratch);
         // Keep the placement map separate while glyph pages may be allocated.
         let mut layouts = core::mem::take(&mut self.paint_cache.layouts);
-        let key = [slot as u64, self.font_revisions[slot as usize], r.tracking.to_bits() as u64,
+        let key = [slot as u64, content_rev, r.tracking.to_bits() as u64,
             r.line_height.to_bits() as u64, r.text_align as u64, box_w.to_bits() as u64];
-        let mut cached = atlas.stream.is_none() && layouts.get(&node_slot)
+        let mut cached = !has_stream && layouts.get(&node_slot)
             .is_some_and(|entry| entry.key == key && entry.text == run);
         if !cached {
             layouts.remove(&node_slot);
             scratch.clear();
             let misses = self.fonts.misses.get();
-            self.fonts.layout_run(&run, slot, r.tracking, r.line_height, r.text_align, box_w, &mut scratch);
+            let has_dynamic = self.fonts.layout_run_readonly(
+                &run,
+                slot,
+                r.tracking,
+                r.line_height,
+                r.text_align,
+                box_w,
+                &mut scratch,
+            );
+            // Prepare and pin ONLY visible dynamic fallback glyphs under `&mut self.fonts`
+            // before borrowing `self.fonts.atlas(slot)` so off-screen glyphs never exhaust
+            // the batch and earlier visible placements are never overwritten.
+            if has_dynamic && has_dyn {
+                if scaled_axis_aligned {
+                    let viewport = Clip::viewport(self.screen);
+                    let glyph_clip = if self.in_3d { clip } else { &viewport };
+                    for g in &mut scratch {
+                        if g.codepoint < 128 {
+                            continue;
+                        }
+                        let (x, y) = world.apply(g.x, g.y);
+                        if x + cell_w * world.a <= clip.x0
+                            || x >= clip.x1
+                            || y + cell_h * world.d <= clip.y0
+                            || y >= clip.y1
+                        {
+                            continue;
+                        }
+                        let glyph_world = world.then(&Affine::translate(g.x, g.y));
+                        if !Self::scaled_quad_intersects_scissor(
+                            &glyph_world,
+                            cell_w,
+                            cell_h,
+                            glyph_clip,
+                            clip,
+                        ) {
+                            continue;
+                        }
+                        if let Some(gid) = self.fonts.prepare_dynamic_glyph_if_unbaked(
+                            slot,
+                            g.codepoint,
+                            self.draw_root,
+                        ) {
+                            g.gid = gid;
+                        }
+                    }
+                } else {
+                    for g in &mut scratch {
+                        if g.codepoint < 128 {
+                            continue;
+                        }
+                        let (sx, sy) = world.apply(g.x, g.y);
+                        let (rx, ry) = (roundf(sx), roundf(sy));
+                        if rx < 0.0 || ry < 0.0 || rx > self.screen.0 || ry > self.screen.1 {
+                            continue;
+                        }
+                        if rx + cell_w <= clip.x0
+                            || rx >= clip.x1
+                            || ry + cell_h <= clip.y0
+                            || ry >= clip.y1
+                        {
+                            continue;
+                        }
+                        if let Some(gid) = self.fonts.prepare_dynamic_glyph_if_unbaked(
+                            slot,
+                            g.codepoint,
+                            self.draw_root,
+                        ) {
+                            g.gid = gid;
+                        }
+                    }
+                }
+            }
             if scratch.len() <= 256 && scratch.capacity() > 256 { scratch.shrink_to_fit(); }
-            if atlas.stream.is_none() && self.fonts.misses.get() == misses &&
+            // Never cache layouts that resolved any dynamic LRU glyph so later frames
+            // always re-pin visible dynamic cells and cannot reuse evicted gids.
+            if !has_stream && !has_dynamic && self.fonts.misses.get() == misses &&
                 run.capacity() <= 256 && scratch.capacity() <= 256 {
                 // At most 256 strings (64 KiB) and 16,384 placements (256 KiB),
-                // plus entry metadata. Streamed/missing glyphs bypass caching.
+                // plus entry metadata. Streamed/dynamic/missing glyphs bypass caching.
                 while layouts.len() >= 256 || layouts.values().map(|e| e.glyphs.capacity()).sum::<usize>() + scratch.capacity() > 16_384 {
                     let oldest = *layouts.iter().min_by_key(|(_, e)| e.used).unwrap().0;
                     layouts.remove(&oldest);
@@ -2849,7 +3329,12 @@ impl<'a> Walker<'a> {
             }
             &entry.glyphs
         } else { &scratch };
-        if world.is_axis_aligned() && (world.a != 1.0 || world.d != 1.0) {
+        let Some(atlas) = self.fonts.atlas(slot) else {
+            self.glyph_scratch = scratch;
+            self.paint_cache.layouts = layouts;
+            return;
+        };
+        if scaled_axis_aligned {
             let mut page: Option<GlyphSampler> = None;
             // The 2D overflow stack already clips pixels with SCISSOR. Keep
             // full glyph endpoints inside the viewport: reconstructing UVs
@@ -2857,20 +3342,31 @@ impl<'a> Walker<'a> {
             // including ink that remains visible to the left of that clip.
             let viewport = Clip::viewport(self.screen);
             let glyph_clip = if self.in_3d { clip } else { &viewport };
+            let page_use = GlyphPageUse::from_root(self.draw_root);
             for g in glyphs {
                 let (x, y) = world.apply(g.x, g.y);
                 if x + cell_w * world.a <= clip.x0 || x >= clip.x1 ||
                     y + cell_h * world.d <= clip.y0 || y >= clip.y1 || !atlas.stream_visible(g.codepoint, g.gid) {
                     continue;
                 }
+                let glyph_world = world.then(&Affine::translate(g.x, g.y));
+                if !Self::scaled_quad_intersects_scissor(&glyph_world, cell_w, cell_h, glyph_clip, clip) {
+                    continue;
+                }
                 if !page.as_ref().is_some_and(|page| page.contains(g.gid)) {
-                    page = glyph_page(self.paint_cache, self.textures, self.tex_free,
-                        atlas, self.font_revisions[slot as usize], g.gid);
+                    page = glyph_page(
+                        self.paint_cache,
+                        self.textures,
+                        self.tex_free,
+                        atlas,
+                        self.font_revisions[slot as usize],
+                        g.gid,
+                        page_use,
+                    );
                 }
                 let Some(page) = page.as_ref() else { continue; };
                 let texture = page.handle;
                 let uv = page.uv(g.gid);
-                let glyph_world = world.then(&Affine::translate(g.x, g.y));
                 let before = dl.words.len();
                 self.emit_tex_quad(dl, &glyph_world, cell_w, cell_h, texture, 1.0, glyph_clip, uv[0], uv[1], uv[2], uv[3]);
                 if dl.words.len() > before { *dl.words.last_mut().unwrap() = color; }

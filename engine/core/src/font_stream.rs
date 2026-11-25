@@ -139,9 +139,9 @@ impl Atlas {
         })
     }
 
-    fn stream_configure(&mut self, b: &[u8]) -> bool {
+    fn stream_configure(&mut self, b: &[u8], dyn_budget_bytes: usize) -> bool {
         let generation = u32_at(b, 4).unwrap();
-        let base = self.stream.as_ref().map_or(self.glyph_count, |s| s.base);
+        let base = self.baked_count;
         let base_texture_width = self
             .stream
             .as_ref()
@@ -163,7 +163,8 @@ impl Atlas {
             for g in 0..base as usize {
                 for y in 0..h {
                     let from = g * old_w * old_h + y * old_w;
-                    self.bitmap.copy_within(from..from + w, g * w * h + y * w);
+                    self.bitmap
+                        .copy_within(from..from + w, g * w * h + y * w);
                 }
             }
             self.cell_w = base_cell_w;
@@ -174,6 +175,7 @@ impl Atlas {
             self.cmap.retain(|e| e.gid < base);
             self.cmap.shrink_to_fit();
             self.bitmap.truncate(base as usize * w * h);
+            self.restore_dynamic_cache(dyn_budget_bytes);
             self.bitmap.shrink_to_fit();
             return true;
         }
@@ -200,6 +202,9 @@ impl Atlas {
         if cw * ch > MAX_PIXELS {
             return false;
         }
+        // Drop any on-demand fallback cache while streaming is active so we
+        // never copy/pad unused dynamic cells or pay double RAM.
+        self.drop_dynamic_cache();
         let mut pixels = vec![0; (base as usize + capacity) * cw * ch];
         for g in 0..base as usize {
             for y in 0..old_h {
@@ -309,7 +314,8 @@ impl Atlas {
             entry.seen.set(s.epoch.get());
             let gid = s.base + index as u16;
             let dest_cell = (self.cell_w * self.cell_h) as usize;
-            let dest = &mut self.bitmap[gid as usize * dest_cell..(gid as usize + 1) * dest_cell];
+            let dest =
+                &mut self.bitmap[gid as usize * dest_cell..(gid as usize + 1) * dest_cell];
             dest.fill(0);
             entry.ink_width = 0;
             for p in 0..cell {
@@ -381,7 +387,12 @@ impl Ui {
         {
             return false;
         }
-        let ok = self.fonts.atlas_mut(slot).unwrap().stream_configure(b);
+        let dyn_budget = self.fonts.remaining_dynamic_budget_for(slot as usize);
+        let ok = self
+            .fonts
+            .atlas_mut(slot)
+            .unwrap()
+            .stream_configure(b, dyn_budget);
         if ok {
             self.font_revisions[slot as usize] = self.font_revisions[slot as usize].wrapping_add(1);
             self.mark_layout_dirty();

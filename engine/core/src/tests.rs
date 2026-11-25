@@ -3932,9 +3932,9 @@ fn streamed_detach_reclaims_capacity_and_restores_baked_cells_across_slots() {
         }
         assert!(ui.load_font_atlas(&atlas));
     }
-    let baked = ui.font_atlas(0).unwrap().bitmap.clone();
+    let baked = ui.font_atlas(0).unwrap().bitmap_slice().to_vec();
     let baseline: usize = (0..4)
-        .map(|s| ui.font_atlas(s).unwrap().bitmap.capacity())
+        .map(|s| ui.font_atlas(s).unwrap().bitmap_capacity())
         .sum();
     for generation in 1..=3 {
         for slot in 0..4 {
@@ -3950,7 +3950,7 @@ fn streamed_detach_reclaims_capacity_and_restores_baked_cells_across_slots() {
             config[16..18].fill(0);
             assert!(ui.font_stream_configure(&config));
             let actual: usize = (0..4)
-                .map(|s| ui.font_atlas(s).unwrap().bitmap.capacity())
+                .map(|s| ui.font_atlas(s).unwrap().bitmap_capacity())
                 .sum();
             assert_eq!(
                 actual, baseline,
@@ -3958,7 +3958,7 @@ fn streamed_detach_reclaims_capacity_and_restores_baked_cells_across_slots() {
             );
             let atlas = ui.font_atlas(slot).unwrap();
             assert_eq!((atlas.cell_w, atlas.cell_h), (8, 8));
-            assert_eq!(atlas.bitmap, baked);
+            assert_eq!(atlas.bitmap_slice(), baked.as_slice());
             assert_eq!(atlas.cmap.capacity(), atlas.cmap.len());
             assert!(ui.font_stream_stats().contains("\"bytes\":0"));
             assert_eq!(ui.measure_text("AA", slot), 12.0);
@@ -4214,4 +4214,796 @@ fn stable_motion_paint_rounds_translations_for_paint_and_hits() {
     assert_ne!(ui.hit_test_bounds(5.0, 26.8), spec::ROOT_ID);
     ui.set_stable_motion_paint(false);
     assert_ne!(ui.hit_test_bounds(5.0, 2.8), spec::ROOT_ID);
+}
+
+#[test]
+fn dynamic_cjk_draw_pass_exceeding_capacity_never_corrupts_earlier_placements() {
+    use ab_glyph::Font as AbFont;
+
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    // Compact 17x15 atlas at slot 0 with only ASCII 'A' and tofu baked.
+    let blob = encode_atlas(0, 17, 15, 12, 15, 2, &[(65, 1, 7), (0xfffd, 0, 17)]);
+    let mut ui = Ui::new();
+    ui.set_viewport(800.0, 800.0);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref.clone()));
+    let dyn_cap = ui.font_atlas(0).unwrap().dyn_cap();
+    assert!(dyn_cap > 32);
+
+    // Collect `dyn_cap + 64` distinct CJK characters supported by the fallback TTF,
+    // wrapped across lines so EVERY character is visible inside the 800x800 viewport.
+    let mut chars = Vec::with_capacity(dyn_cap + 64);
+    for cp in 0x4E00u32..0x9FFFu32 {
+        if let Some(ch) = char::from_u32(cp) {
+            if font_ref.glyph_id(ch).0 != 0 {
+                chars.push(ch);
+                if chars.len() == dyn_cap + 64 {
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(chars.len(), dyn_cap + 64);
+    let mut text_str = alloc::string::String::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        if i > 0 && i % 32 == 0 {
+            text_str.push('\n');
+        }
+        text_str.push(ch);
+    }
+
+    let node = ui.create_node(spec::NodeType::Text as u8);
+    ui.insert_before(spec::ROOT_ID, node, 0);
+    ui.set_text(node, &text_str);
+    ui.tick();
+
+    let rev_before = ui.font_atlas_revision(0);
+    let raster_before = ui.raster_revision();
+    let words = ui.draw().words.clone();
+    assert_ne!(ui.font_atlas_revision(0), rev_before);
+    assert_ne!(ui.raster_revision(), raster_before);
+
+    // Extract every placed gid from the emitted GLYPH_RUN(s).
+    let mut emitted_gids = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if words[i] == spec::draw_op::GLYPH_RUN {
+            let count = (words[i + 1] >> 16) as usize;
+            for k in 0..count {
+                emitted_gids.push(words[i + 3 + k * 2 + 1] as u16);
+            }
+            i += 3 + count * 2;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(emitted_gids.len(), dyn_cap + 64);
+
+    // Reference fresh rasterization for the first 8 characters to verify none
+    // of their dynamic cells were overwritten by the 64 overflow characters.
+    let mut ref_atlas = crate::text::Atlas::parse_with_fallback(&blob, font_ref.clone()).unwrap();
+    let atlas = ui.font_atlas(0).unwrap();
+    for k in 0..dyn_cap {
+        assert!(
+            emitted_gids[k] >= atlas.baked_count,
+            "first dyn_cap glyphs must resolve to dynamic cells (index {k})"
+        );
+    }
+    for k in 0..8 {
+        let ref_epoch = ref_atlas.begin_batch();
+        let (ref_gid, _, _) = ref_atlas
+            .prepare_dynamic_glyph(chars[k] as u32, ref_epoch)
+            .unwrap();
+        assert_eq!(
+            atlas.glyph_rows(emitted_gids[k]),
+            ref_atlas.glyph_rows(ref_gid),
+            "earlier placed glyph {k} was corrupted by overflow in the same draw pass"
+        );
+    }
+    // Overflow characters beyond `dyn_cap` safely degrade to tofu (gid 0).
+    for k in dyn_cap..(dyn_cap + 64) {
+        assert_eq!(
+            emitted_gids[k], 0,
+            "overflow glyph {k} must degrade to tofu rather than evicting pinned cells"
+        );
+    }
+
+    // Also verify off-screen glyphs do not starve visible glyphs on a narrow viewport.
+    let mut ui2 = Ui::new();
+    ui2.set_viewport(120.0, 40.0);
+    assert!(ui2.load_font_atlas_with_fallback(&blob, font_ref));
+    let mut line = alloc::string::String::new();
+    for &ch in &chars[..dyn_cap + 10] {
+        line.push(ch);
+    }
+    let scrolled = ui2.create_node(spec::NodeType::Text as u8);
+    ui2.insert_before(spec::ROOT_ID, scrolled, 0);
+    ui2.set_text(scrolled, &line);
+    // Shift far left so the first `dyn_cap` glyphs are off-screen and only the tail is visible.
+    let (prefix_w, _) = {
+        let prefix: alloc::string::String = chars[..dyn_cap].iter().collect();
+        (ui2.measure_text(&prefix, 0), 0.0)
+    };
+    ui2.set_prop(scrolled, spec::prop::TRANSLATE_X, -prefix_w as f64);
+    ui2.tick();
+    let words2 = ui2.draw().words.clone();
+    let mut visible_gids = Vec::new();
+    let mut j = 0;
+    while j < words2.len() {
+        if words2[j] == spec::draw_op::GLYPH_RUN {
+            let count = (words2[j + 1] >> 16) as usize;
+            for k in 0..count {
+                visible_gids.push(words2[j + 3 + k * 2 + 1] as u16);
+            }
+            j += 3 + count * 2;
+        } else {
+            break;
+        }
+    }
+    assert!(!visible_gids.is_empty());
+    let baked = ui2.font_atlas(0).unwrap().baked_count;
+    assert!(
+        visible_gids.iter().all(|&gid| gid >= baked),
+        "visible tail glyphs must resolve dynamically without off-screen chars exhausting batch"
+    );
+}
+
+#[test]
+fn font_stream_attach_uses_baked_count_and_detach_restores_dynamic_cache() {
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    let mut ui = Ui::new();
+    let blob = encode_atlas(2, 8, 8, 7, 10, 2, &[(65, 1, 6), (0xfffd, 0, 8)]);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref));
+    let initial_dyn = ui.font_atlas(2).unwrap().dyn_cap();
+    assert!(initial_dyn > 0);
+    assert_eq!(ui.font_atlas(2).unwrap().glyph_count, 2 + initial_dyn as u16);
+
+    // Attach stream: must use `baked_count` (2) as base and drop `dyn_cache`.
+    assert!(ui.font_stream_configure(&stream_config(1, 32)));
+    let streamed = ui.font_atlas(2).unwrap();
+    assert_eq!(streamed.baked_count, 2);
+    assert_eq!(streamed.glyph_count, 2 + 32);
+    assert_eq!(streamed.dyn_cap(), 0);
+    assert!(!streamed.has_dynamic_cache());
+
+    // Detach stream: must restore empty dynamic cache cleanly.
+    assert!(ui.font_stream_configure(&stream_config(0, 0)));
+    let restored = ui.font_atlas(2).unwrap();
+    assert_eq!(restored.baked_count, 2);
+    assert_eq!(restored.dyn_cap(), initial_dyn);
+    assert_eq!(restored.glyph_count, 2 + initial_dyn as u16);
+    assert!(restored.has_dynamic_cache());
+}
+
+#[test]
+fn scaled_glyph_page_cache_hit_and_prepare_glyph_page_stay_live_across_mid_draw_invalidation() {
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    let blob = encode_atlas(0, 17, 15, 12, 15, 2, &[(65, 1, 7), (0xfffd, 0, 17)]);
+    let mut ui = Ui::new();
+    ui.set_viewport(320.0, 200.0);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref));
+
+    // Frame 1: scaled node A ("A") creates cached glyph page `h0`.
+    let node_a = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(node_a, "A");
+    ui.set_prop(node_a, spec::prop::SCALE, 1.5);
+    ui.set_prop(node_a, spec::prop::ORIGIN_X, -0.5);
+    ui.set_prop(node_a, spec::prop::ORIGIN_Y, -0.5);
+    ui.insert_before(spec::ROOT_ID, node_a, 0);
+    ui.tick();
+    let frame1 = ui.draw().words.clone();
+    assert_eq!(frame1[0], spec::draw_op::TEX_QUAD);
+    let h0 = frame1[1] as i32;
+    assert!(ui.texture(h0).is_some());
+
+    // Frame 2: node A reuses `h0` (cache hit!), then node B prepares a new CJK
+    // glyph in the SAME slot, invalidating `h0` mid-draw. `h0` must be retired
+    // (NOT freed) so node A's emitted TEX_QUAD handle stays live!
+    let node_b = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(node_b, "你");
+    ui.set_prop(node_b, spec::prop::SCALE, 1.5);
+    ui.set_prop(node_b, spec::prop::ORIGIN_X, -0.5);
+    ui.set_prop(node_b, spec::prop::ORIGIN_Y, -0.5);
+    ui.insert_before(spec::ROOT_ID, node_b, 0);
+    ui.tick();
+    let frame2 = ui.draw().words.clone();
+    let mut handles2 = Vec::new();
+    let mut i = 0;
+    while i < frame2.len() {
+        if frame2[i] == spec::draw_op::TEX_QUAD {
+            handles2.push(frame2[i + 1] as i32);
+            i += 9;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(handles2.len(), 2);
+    assert_eq!(handles2[0], h0, "early node A must hit cached page h0");
+    let h1 = handles2[1];
+    assert_ne!(h1, h0, "later node B must allocate a fresh page after dyn_revision bump");
+    assert!(
+        ui.texture(h0).is_some(),
+        "cached page h0 hit in current draw must remain live after mid-draw invalidation"
+    );
+    assert!(ui.texture(h1).is_some());
+
+    // Frame 3: primary advances to a new draw pass -> retired `h0` is now reaped.
+    let _ = ui.draw();
+    assert!(ui.texture(h0).is_none(), "superseded h0 should be reaped on next primary draw");
+    assert!(ui.texture(h1).is_some());
+
+    // Verify `prepare_glyph_page` stamps active draw sequence: acquire `h1`
+    // via `prepare_glyph_page`, then run an auxiliary draw that mutates slot 0
+    // and invalidates `h1`. `h1` must stay live for the retained primary list
+    // until the next primary draw!
+    let prepared = ui.prepare_glyph_page(0, 1).unwrap().handle as i32;
+    assert_eq!(prepared, h1);
+    let aux_root = ui.create_auxiliary_surface(160.0, 100.0);
+    let aux_text = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(aux_text, "好");
+    ui.set_prop(aux_text, spec::prop::SCALE, 1.5);
+    ui.set_prop(aux_text, spec::prop::ORIGIN_X, -0.5);
+    ui.set_prop(aux_text, spec::prop::ORIGIN_Y, -0.5);
+    ui.insert_before(aux_root, aux_text, 0);
+    let aux_words = ui.draw_auxiliary().unwrap().words.clone();
+    assert_eq!(aux_words[0], spec::draw_op::TEX_QUAD);
+    let h_aux = aux_words[1] as i32;
+    assert_ne!(h_aux, h1);
+    assert!(
+        ui.texture(h1).is_some(),
+        "page handle stamped by primary/prepare_glyph_page must survive auxiliary invalidation"
+    );
+    assert!(ui.texture(h_aux).is_some());
+}
+
+#[test]
+fn auxiliary_draw_preserves_primary_dynamic_glyph_cells_and_pages() {
+    use ab_glyph::Font as AbFont;
+
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    let blob = encode_atlas(0, 17, 15, 12, 15, 2, &[(65, 1, 7), (0xfffd, 0, 17)]);
+    let mut ui = Ui::new();
+    ui.set_viewport(800.0, 800.0);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref.clone()));
+    let dyn_cap = ui.font_atlas(0).unwrap().dyn_cap();
+    assert!(dyn_cap > 32);
+
+    // Collect `dyn_cap + 8` distinct CJK characters: first `dyn_cap` fill
+    // primary completely, last 8 are used by auxiliary.
+    let mut chars = Vec::with_capacity(dyn_cap + 8);
+    for cp in 0x4E00u32..0x9FFFu32 {
+        if let Some(ch) = char::from_u32(cp) {
+            if font_ref.glyph_id(ch).0 != 0 {
+                chars.push(ch);
+                if chars.len() == dyn_cap + 8 {
+                    break;
+                }
+            }
+        }
+    }
+    let mut primary_str = alloc::string::String::new();
+    for (i, &ch) in chars[..dyn_cap].iter().enumerate() {
+        if i > 0 && i % 32 == 0 {
+            primary_str.push('\n');
+        }
+        primary_str.push(ch);
+    }
+    let primary_node = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(primary_node, &primary_str);
+    ui.insert_before(spec::ROOT_ID, primary_node, 0);
+    let primary_scaled = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(primary_scaled, "A");
+    ui.set_prop(primary_scaled, spec::prop::SCALE, 1.5);
+    ui.set_prop(primary_scaled, spec::prop::ORIGIN_X, -0.5);
+    ui.set_prop(primary_scaled, spec::prop::ORIGIN_Y, -0.5);
+    ui.insert_before(spec::ROOT_ID, primary_scaled, 0);
+    ui.tick();
+
+    let primary_words = ui.draw().words.clone();
+    let mut primary_gids = Vec::new();
+    let mut primary_tex = None;
+    let mut i = 0;
+    while i < primary_words.len() {
+        if primary_words[i] == spec::draw_op::GLYPH_RUN {
+            let count = (primary_words[i + 1] >> 16) as usize;
+            for k in 0..count {
+                primary_gids.push(primary_words[i + 3 + k * 2 + 1] as u16);
+            }
+            i += 3 + count * 2;
+        } else if primary_words[i] == spec::draw_op::TEX_QUAD {
+            primary_tex = Some(primary_words[i + 1] as i32);
+            i += 9;
+        } else {
+            break;
+        }
+    }
+    assert_eq!(primary_gids.len(), dyn_cap);
+    let primary_tex = primary_tex.expect("primary scaled TEX_QUAD");
+    let primary_snapshots: Vec<Vec<u8>> = primary_gids
+        .iter()
+        .take(16)
+        .map(|&gid| ui.font_atlas(0).unwrap().glyph_rows(gid).to_vec())
+        .collect();
+
+    // Now draw auxiliary with brand-new CJK glyphs while `current_draw_list()`
+    // is still retained. Auxiliary MUST NOT evict any primary GID or free `primary_tex`.
+    let aux_root = ui.create_auxiliary_surface(200.0, 100.0);
+    let aux_str: alloc::string::String = chars[dyn_cap..].iter().collect();
+    let aux_node = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(aux_node, &aux_str);
+    ui.insert_before(aux_root, aux_node, 0);
+    let aux_words = ui.draw_auxiliary().unwrap().words.clone();
+    assert_eq!(aux_words[0], spec::draw_op::GLYPH_RUN);
+    let aux_count = (aux_words[1] >> 16) as usize;
+    for k in 0..aux_count {
+        assert_eq!(
+            aux_words[3 + k * 2 + 1] as u16,
+            0,
+            "auxiliary overflow must degrade to tofu rather than overwriting primary's pinned cells"
+        );
+    }
+    for (idx, (&gid, expected)) in primary_gids.iter().take(16).zip(&primary_snapshots).enumerate() {
+        assert_eq!(
+            ui.font_atlas(0).unwrap().glyph_rows(gid),
+            expected.as_slice(),
+            "primary glyph {idx} (gid {gid}) was corrupted by draw_auxiliary()"
+        );
+    }
+    assert!(
+        ui.texture(primary_tex).is_some(),
+        "primary glyph page handle must remain live after draw_auxiliary()"
+    );
+}
+
+#[test]
+fn tiny_scaled_cjk_run_rounding_to_zero_pixels_never_pins_dynamic_cells() {
+    use ab_glyph::Font as AbFont;
+
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    let blob = encode_atlas(0, 17, 15, 12, 15, 2, &[(65, 1, 7), (0xfffd, 0, 17)]);
+    let mut ui = Ui::new();
+    ui.set_viewport(320.0, 200.0);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref.clone()));
+    let dyn_cap = ui.font_atlas(0).unwrap().dyn_cap();
+
+    // Collect `dyn_cap` distinct CJK chars for a tiny scaled node whose
+    // destination quad rounds to 0px wide & tall (`17 * 0.01 = 0.17 -> roundf = 0`).
+    let mut tiny_chars = alloc::string::String::new();
+    let mut count = 0usize;
+    for cp in 0x4E00u32..0x9FFFu32 {
+        if let Some(ch) = char::from_u32(cp) {
+            if font_ref.glyph_id(ch).0 != 0 {
+                tiny_chars.push(ch);
+                count += 1;
+                if count == dyn_cap {
+                    break;
+                }
+            }
+        }
+    }
+    let tiny_node = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(tiny_node, &tiny_chars);
+    ui.set_prop(tiny_node, spec::prop::SCALE, 0.01);
+    ui.set_prop(tiny_node, spec::prop::ORIGIN_X, -0.5);
+    ui.set_prop(tiny_node, spec::prop::ORIGIN_Y, -0.5);
+    ui.insert_before(spec::ROOT_ID, tiny_node, 0);
+
+    // Follow with a visible normal-scale CJK label using different characters.
+    let visible_text = "你好世界";
+    let visible_node = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(visible_node, visible_text);
+    ui.insert_before(spec::ROOT_ID, visible_node, 0);
+    ui.tick();
+
+    let words = ui.draw().words.clone();
+    // Tiny scaled node must emit ZERO TEX_QUADs and consume ZERO dynamic slots.
+    let mut tex_quads = 0usize;
+    let mut visible_gids = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        match words[i] {
+            op if op == spec::draw_op::TEX_QUAD => {
+                tex_quads += 1;
+                i += 9;
+            }
+            op if op == spec::draw_op::GLYPH_RUN => {
+                let count = (words[i + 1] >> 16) as usize;
+                for k in 0..count {
+                    visible_gids.push(words[i + 3 + k * 2 + 1] as u16);
+                }
+                i += 3 + count * 2;
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(tex_quads, 0, "0px rounded scaled run must not emit TEX_QUADs");
+    assert_eq!(visible_gids.len(), visible_text.chars().count());
+    let atlas = ui.font_atlas(0).unwrap();
+    assert_eq!(
+        atlas.dynamic_revision(),
+        visible_text.chars().count() as u64,
+        "0px scaled run must not rasterize or pin any dynamic cells"
+    );
+    assert!(
+        visible_gids.iter().all(|&gid| gid >= atlas.baked_count),
+        "visible label must not be starved into tofu by a 0px scaled run"
+    );
+}
+
+#[test]
+fn idle_auxiliary_does_not_leak_retired_primary_pages_across_prepare_glyph_page() {
+    use ab_glyph::Font as AbFont;
+
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    let blob = encode_atlas(0, 17, 15, 12, 15, 2, &[(65, 1, 7), (0xfffd, 0, 17)]);
+    let mut ui = Ui::new();
+    ui.set_viewport(320.0, 200.0);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref.clone()));
+
+    let mut cjk_chars = Vec::new();
+    for cp in 0x4E00u32..0x9FFFu32 {
+        if let Some(ch) = char::from_u32(cp) {
+            if font_ref.glyph_id(ch).0 != 0 {
+                cjk_chars.push(ch);
+                if cjk_chars.len() == 20 {
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(cjk_chars.len(), 20);
+
+    // Draw auxiliary ONCE so `aux_seq` becomes non-zero, then leave auxiliary idle.
+    let aux_root = ui.create_auxiliary_surface(160.0, 80.0);
+    let aux_text = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(aux_text, "A");
+    ui.insert_before(aux_root, aux_text, 0);
+    assert!(ui.draw_auxiliary().is_some());
+
+    // Primary updates CJK text across 16 frames and acquires pages via
+    // `prepare_glyph_page` (exercising both miss and hit paths).
+    let primary_node = ui.create_node(spec::NodeType::Text as u8);
+    ui.insert_before(spec::ROOT_ID, primary_node, 0);
+
+    let mut handles = Vec::new();
+    for &ch in &cjk_chars[..16] {
+        let mut s = alloc::string::String::new();
+        s.push(ch);
+        ui.set_text(primary_node, &s);
+        ui.tick();
+        let _ = ui.draw();
+        // First call allocates (miss), second call hits cache — neither may stamp `aux_seq`.
+        let h_miss = ui.prepare_glyph_page(0, 1).unwrap().handle as i32;
+        let h_hit = ui.prepare_glyph_page(0, 1).unwrap().handle as i32;
+        assert_eq!(h_miss, h_hit);
+        handles.push(h_miss);
+    }
+
+    // Earlier frames' pages must have been reaped despite idle auxiliary.
+    for (idx, &old_handle) in handles[..handles.len() - 1].iter().enumerate() {
+        assert!(
+            ui.texture(old_handle).is_none(),
+            "superseded page from frame {idx} leaked while auxiliary was idle"
+        );
+    }
+    let last_handle = *handles.last().unwrap();
+    assert!(
+        ui.texture(last_handle).is_some(),
+        "current frame's externally prepared page must remain live"
+    );
+    let live_textures = (0..ui.texture_slot_count() as u32)
+        .filter(|&slot| ui.texture_at(slot).is_some())
+        .count();
+    assert_eq!(
+        live_textures, 1,
+        "only the current glyph page should remain live (got {live_textures})"
+    );
+
+    // Explicit release point: invalidate via auxiliary draw, confirm external
+    // page survives until `release_external_glyph_pages()`, then confirm reap.
+    let mut aux_s = alloc::string::String::new();
+    aux_s.push(cjk_chars[19]);
+    ui.set_text(aux_text, &aux_s);
+    ui.set_prop(aux_text, spec::prop::SCALE, 1.5);
+    ui.set_prop(aux_text, spec::prop::ORIGIN_X, -0.5);
+    ui.set_prop(aux_text, spec::prop::ORIGIN_Y, -0.5);
+    let _ = ui.draw_auxiliary();
+    assert!(
+        ui.texture(last_handle).is_some(),
+        "externally prepared page must stay live across auxiliary invalidation"
+    );
+    ui.release_external_glyph_pages();
+    assert!(
+        ui.texture(last_handle).is_none(),
+        "explicit release_external_glyph_pages must reap retired external page"
+    );
+}
+
+#[test]
+fn scissored_out_rounded_scaled_cjk_cells_never_pin_dynamic_slots_or_acquire_page() {
+    use ab_glyph::Font as AbFont;
+
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    let blob = encode_atlas(0, 17, 15, 12, 15, 2, &[(65, 1, 7), (0xfffd, 0, 17)]);
+    let mut ui = Ui::new();
+    ui.set_viewport(320.0, 2400.0);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref.clone()));
+    let dyn_cap = ui.font_atlas(0).unwrap().dyn_cap();
+
+    // Build a vertical column of `dyn_cap` distinct CJK characters positioned at
+    // `x = 9.8` inside an `overflow: hidden` box ending at `x = 10.0`.
+    // Each cell overlaps `(0..10)` in float (`9.8 < 10.0`), but its packed
+    // TEX_QUAD starts at `roundf(9.8) = 10`, which SCISSOR [0, 10) discards
+    // 100% of. None of these cells may pin dynamic slots or acquire a glyph page.
+    let mut clipped_col = alloc::string::String::new();
+    let mut count = 0usize;
+    for cp in 0x4E00u32..0x9FFFu32 {
+        if let Some(ch) = char::from_u32(cp) {
+            if font_ref.glyph_id(ch).0 != 0 {
+                if count > 0 {
+                    clipped_col.push('\n');
+                }
+                clipped_col.push(ch);
+                count += 1;
+                if count == dyn_cap {
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(count, dyn_cap);
+
+    let clip_box = ui.create_node(spec::NodeType::View as u8);
+    ui.set_prop(clip_box, spec::prop::WIDTH, 10.0);
+    ui.set_prop(clip_box, spec::prop::HEIGHT, 2200.0);
+    ui.set_prop(clip_box, spec::prop::OVERFLOW, spec::Overflow::Hidden as u8 as f64);
+    ui.insert_before(spec::ROOT_ID, clip_box, 0);
+
+    let clipped_node = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(clipped_node, &clipped_col);
+    ui.set_prop(clipped_node, spec::prop::TRANSLATE_X, 9.8);
+    ui.set_prop(clipped_node, spec::prop::SCALE, 1.25);
+    ui.set_prop(clipped_node, spec::prop::ORIGIN_X, -0.5);
+    ui.set_prop(clipped_node, spec::prop::ORIGIN_Y, -0.5);
+    ui.insert_before(clip_box, clipped_node, 0);
+
+    // Follow with a visible normal-scale CJK label using different characters.
+    let visible_text = "你好世界";
+    let visible_node = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(visible_node, visible_text);
+    ui.insert_before(spec::ROOT_ID, visible_node, 0);
+    ui.tick();
+
+    let words = ui.draw().words.clone();
+    let mut tex_quads = 0usize;
+    let mut visible_gids = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        match words[i] {
+            op if op == spec::draw_op::SCISSOR => i += 3,
+            op if op == spec::draw_op::SCISSOR_POP => i += 1,
+            op if op == spec::draw_op::TEX_QUAD => {
+                tex_quads += 1;
+                i += 9;
+            }
+            op if op == spec::draw_op::GLYPH_RUN => {
+                let n = (words[i + 1] >> 16) as usize;
+                for k in 0..n {
+                    visible_gids.push(words[i + 3 + k * 2 + 1] as u16);
+                }
+                i += 3 + n * 2;
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        tex_quads, 0,
+        "scissored-out rounded scaled cells at x=9.8 with clip.x1=10 must not emit TEX_QUADs"
+    );
+    assert_eq!(
+        ui.texture_slot_count(),
+        0,
+        "scissored-out rounded scaled cells must not acquire a glyph page texture"
+    );
+    assert_eq!(visible_gids.len(), visible_text.chars().count());
+    let atlas = ui.font_atlas(0).unwrap();
+    assert_eq!(
+        atlas.dynamic_revision(),
+        visible_text.chars().count() as u64,
+        "scissored-out rounded scaled cells must not rasterize or pin any dynamic slots"
+    );
+    assert!(
+        visible_gids.iter().all(|&gid| gid >= atlas.baked_count),
+        "visible CJK label must not degrade to tofu because of scissored-out scaled cells"
+    );
+}
+
+#[test]
+fn multiple_scaled_single_cjk_nodes_share_one_glyph_page_in_draw() {
+    use ab_glyph::Font as AbFont;
+
+    let ttf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../app/fonts/DroidSansFallbackFull.ttf");
+    let ttf_bytes: &'static [u8] = Box::leak(
+        std::fs::read(&ttf_path)
+            .expect("DroidSansFallbackFull.ttf must exist")
+            .into_boxed_slice(),
+    );
+    let font_ref = ab_glyph::FontRef::try_from_slice_and_index(ttf_bytes, 0).unwrap();
+
+    let blob = encode_atlas(0, 17, 15, 12, 15, 2, &[(65, 1, 7), (0xfffd, 0, 17)]);
+    let mut ui = Ui::new();
+    ui.set_viewport(320.0, 600.0);
+    assert!(ui.load_font_atlas_with_fallback(&blob, font_ref.clone()));
+
+    let mut chars = Vec::new();
+    for cp in 0x4E00u32..0x9FFFu32 {
+        if let Some(ch) = char::from_u32(cp) {
+            if font_ref.glyph_id(ch).0 != 0 {
+                chars.push(ch);
+                if chars.len() == 20 {
+                    break;
+                }
+            }
+        }
+    }
+    assert_eq!(chars.len(), 20);
+
+    // Mount 10 separate scaled single-CJK-character text nodes in one draw pass.
+    for &ch in &chars[..10] {
+        let mut s = alloc::string::String::new();
+        s.push(ch);
+        let node = ui.create_node(spec::NodeType::Text as u8);
+        ui.set_text(node, &s);
+        ui.set_prop(node, spec::prop::SCALE, 1.5);
+        ui.set_prop(node, spec::prop::ORIGIN_X, -0.5);
+        ui.set_prop(node, spec::prop::ORIGIN_Y, -0.5);
+        ui.insert_before(spec::ROOT_ID, node, 0);
+    }
+    ui.tick();
+
+    let words = ui.draw().words.clone();
+    let mut quad_handles = Vec::new();
+    let mut quad_uvs = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        assert_eq!(words[i], spec::draw_op::TEX_QUAD);
+        quad_handles.push(words[i + 1] as i32);
+        quad_uvs.push([
+            f32::from_bits(words[i + 4]),
+            f32::from_bits(words[i + 5]),
+            f32::from_bits(words[i + 6]),
+            f32::from_bits(words[i + 7]),
+        ]);
+        i += 9;
+    }
+    assert_eq!(quad_handles.len(), 10);
+    let h0 = quad_handles[0];
+    assert!(
+        quad_handles.iter().all(|&h| h == h0),
+        "all 10 single-char scaled CJK nodes in one draw must share one page handle (got {:?})",
+        quad_handles
+    );
+    assert_eq!(
+        ui.texture_slot_count(),
+        1,
+        "10 separate scaled CJK nodes on the same page must allocate only 1 glyph page texture"
+    );
+    assert!(
+        ui.texture_revision(h0).unwrap() >= 9,
+        "shared page texture must bump revision on in-place updates"
+    );
+    // Verify every emitted quad's UV box samples non-zero glyph coverage ink in `h0`.
+    let view = ui.texture(h0).expect("shared glyph page must be live");
+    for (idx, uv) in quad_uvs.iter().enumerate() {
+        let x0 = (uv[0] * view.w as f32).floor() as usize;
+        let y0 = (uv[1] * view.h as f32).floor() as usize;
+        let x1 = ((uv[2] * view.w as f32).ceil() as usize).min(view.w as usize);
+        let y1 = ((uv[3] * view.h as f32).ceil() as usize).min(view.h as usize);
+        let mut has_ink = false;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if view.pixels[py * view.w as usize + px] > 0 {
+                    has_ink = true;
+                    break;
+                }
+            }
+            if has_ink {
+                break;
+            }
+        }
+        assert!(has_ink, "quad {idx} must have non-zero glyph coverage in shared page h0");
+    }
+
+    // Frame 2: keep the first 10 nodes (which hit Frame 1's `h0`) and append 10
+    // MORE distinct scaled single-char CJK nodes. Frame 2 should retire `h0` once
+    // and share one new handle `h1` across all 10 new nodes (total slots == 2, not 11).
+    for &ch in &chars[10..20] {
+        let mut s = alloc::string::String::new();
+        s.push(ch);
+        let node = ui.create_node(spec::NodeType::Text as u8);
+        ui.set_text(node, &s);
+        ui.set_prop(node, spec::prop::SCALE, 1.5);
+        ui.set_prop(node, spec::prop::ORIGIN_X, -0.5);
+        ui.set_prop(node, spec::prop::ORIGIN_Y, -0.5);
+        ui.insert_before(spec::ROOT_ID, node, 0);
+    }
+    ui.tick();
+    let words2 = ui.draw().words.clone();
+    let mut handles2 = Vec::new();
+    let mut i = 0;
+    while i < words2.len() {
+        assert_eq!(words2[i], spec::draw_op::TEX_QUAD);
+        handles2.push(words2[i + 1] as i32);
+        i += 9;
+    }
+    assert_eq!(handles2.len(), 20);
+    assert!(handles2[..10].iter().all(|&h| h == h0));
+    let h1 = handles2[10];
+    assert_ne!(h1, h0);
+    assert!(
+        handles2[10..].iter().all(|&h| h == h1),
+        "all 10 new scaled CJK nodes in Frame 2 must share one handle h1"
+    );
+    assert_eq!(ui.texture_slot_count(), 2);
+
+    // Frame 3: advancing primary draw reaps Frame 1's retired `h0`.
+    let _ = ui.draw();
+    assert!(ui.texture(h0).is_none());
+    assert!(ui.texture(h1).is_some());
 }

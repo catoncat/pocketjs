@@ -50,7 +50,7 @@ import { validateSchema, type ContractDiagnostic } from "../framework/src/manife
 import { verifyPlanHash, verifyPlanProfile, type ResolvedBuildPlan } from "../framework/src/manifest/plan.ts";
 import { POCKET_BINDING_GENERATION } from "../contracts/spec/binding-generation.ts";
 import { registerAnimationTheme, setAnimationTickRate } from "../framework/compiler/animation.ts";
-import { compileClasses, generateStylesModule, suspectClassLiteral, unknownUtilities } from "../framework/compiler/tailwind.ts";
+import { compileClasses, fontSlotInfo, generateStylesModule, suspectClassLiteral, unknownUtilities } from "../framework/compiler/tailwind.ts";
 import { bakeAtlases } from "../framework/compiler/bake-font.ts";
 import { readFontConfig } from "../framework/compiler/font-config.ts";
 import { bakeSvg } from "../framework/compiler/bake-svg.ts";
@@ -347,16 +347,34 @@ const { fallbackTtfs } = fontConfig;
 if (fallbackTtfs.length || fontConfig.codepoints.length)
   console.log(`  fonts: ${fallbackTtfs.length} fallback face(s), ${fontConfig.codepoints.length} declared characters`);
 
-const atlases = await bakeAtlases({
-  codepoints: new Set([...codepoints, ...fontConfig.codepoints]),
-  slots: styles.usedFontSlots,
-  extraChars,
-  rasterDensity,
-  regularTtf: regularFontPath,
-  boldTtf: boldFontPath,
-  onRead: path => buildInputs.add(path),
-  fallbackTtfs,
-});
+const compactSlots = styles.usedFontSlots.filter(s => fontSlotInfo(s).px <= 12);
+const largeSlots = styles.usedFontSlots.filter(s => fontSlotInfo(s).px > 12);
+const atlases = [
+  ...(compactSlots.length
+    ? await bakeAtlases({
+        codepoints: new Set([...codepoints, ...fontConfig.codepoints]),
+        slots: compactSlots,
+        extraChars,
+        rasterDensity,
+        regularTtf: regularFontPath,
+        boldTtf: boldFontPath,
+        onRead: path => buildInputs.add(path),
+        fallbackTtfs,
+      })
+    : []),
+  ...(largeSlots.length
+    ? await bakeAtlases({
+        codepoints,
+        slots: largeSlots,
+        extraChars,
+        rasterDensity,
+        regularTtf: regularFontPath,
+        boldTtf: boldFontPath,
+        onRead: path => buildInputs.add(path),
+        fallbackTtfs,
+      })
+    : []),
+].sort((a, b) => styles.usedFontSlots.indexOf(a.slot) - styles.usedFontSlots.indexOf(b.slot));
 for (const a of atlases) {
   console.log(
     `  font: slot ${a.slot} (${a.px}px${a.bold ? " bold" : ""}) ${a.glyphCount} glyphs, ` +

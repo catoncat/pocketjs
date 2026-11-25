@@ -1510,6 +1510,22 @@ impl Ui {
         ok
     }
 
+    #[cfg(test)]
+    pub(crate) fn load_font_atlas_with_fallback(
+        &mut self,
+        bytes: &[u8],
+        font: ab_glyph::FontRef<'static>,
+    ) -> bool {
+        let ok = self.fonts.load_with_fallback(bytes, font);
+        if ok {
+            let slot = bytes[12] as usize;
+            self.font_revisions[slot] = self.font_revisions[slot].wrapping_add(1);
+            self.mark_layout_dirty();
+            self.bump_raster_revision();
+        }
+        ok
+    }
+
     // ---- animation ---------------------------------------------------------
 
     /// Start a tween/spring on an animatable prop; `from` = current value.
@@ -2116,10 +2132,11 @@ impl Ui {
         } else {
             None
         };
+        let dyn_rev_before = self.fonts.total_dynamic_revision();
         let (target, drawn, provider_stale) = draw::build(
             &self.tree,
             &self.styles,
-            &self.fonts,
+            &mut self.fonts,
             &self.font_revisions,
             self.frame,
             self.layout.viewport,
@@ -2146,7 +2163,7 @@ impl Ui {
             let retry = draw::build(
                 &self.tree,
                 &self.styles,
-                &self.fonts,
+                &mut self.fonts,
                 &self.font_revisions,
                 self.frame,
                 self.layout.viewport,
@@ -2162,6 +2179,9 @@ impl Ui {
             target = retry.0;
             drawn = retry.1;
             debug_assert!(!retry.2, "provider gate must be stable after re-decision");
+        }
+        if self.fonts.total_dynamic_revision() != dyn_rev_before {
+            self.bump_raster_revision();
         }
         self.inspect_drawn = drawn;
         if self.inspect_id != 0 {
@@ -2191,10 +2211,11 @@ impl Ui {
             );
         }
         auxiliary.draw_list.stable_motion_paint = self.stable_motion_paint;
+        let dyn_rev_before = self.fonts.total_dynamic_revision();
         let (target, drawn, provider_stale) = draw::build_root(
             &self.tree,
             &self.styles,
-            &self.fonts,
+            &mut self.fonts,
             &self.font_revisions,
             self.frame,
             auxiliary.root,
@@ -2221,7 +2242,7 @@ impl Ui {
             let retry = draw::build_root(
                 &self.tree,
                 &self.styles,
-                &self.fonts,
+                &mut self.fonts,
                 &self.font_revisions,
                 self.frame,
                 auxiliary.root,
@@ -2242,6 +2263,10 @@ impl Ui {
         auxiliary.inspect_drawn = drawn;
         if target.is_some() {
             self.inspect_rect = target;
+        }
+        if self.fonts.total_dynamic_revision() != dyn_rev_before {
+            self.raster_revision = self.raster_revision.wrapping_add(1);
+            self.resource_revision = self.resource_revision.wrapping_add(1);
         }
         Some(&auxiliary.draw_list)
     }
@@ -2484,18 +2509,40 @@ impl Ui {
         self.fonts.atlas(slot)
     }
 
-    /// Per-slot GPU cache invalidation, including same-count atlas replacements.
+    /// Per-slot GPU cache invalidation, including same-count atlas replacements
+    /// and on-demand dynamic fallback glyph writes.
     pub fn font_atlas_revision(&self, slot: u8) -> u64 {
-        self.font_revisions.get(slot as usize).copied().unwrap_or(0)
+        let base = self.font_revisions.get(slot as usize).copied().unwrap_or(0);
+        match self.fonts.atlas(slot) {
+            Some(atlas) => atlas.content_revision(base),
+            None => base,
+        }
     }
 
     /// Share a generation-checked coverage page between GLYPH_RUN consumers
     /// and transformed TEX_QUAD text. Only requested pages become resident.
-    /// The returned descriptor must be revalidated after any resource mutation.
+    /// The returned descriptor stays live until the next primary `draw()` or
+    /// [`release_external_glyph_pages`](Self::release_external_glyph_pages),
+    /// and must be revalidated after any resource mutation.
     pub fn prepare_glyph_page(&mut self, slot: u8, gid: u16) -> Option<draw::GlyphSampler> {
         let atlas = self.fonts.atlas(slot)?;
-        draw::glyph_page(&mut self.paint_cache, &mut self.textures, &mut self.tex_free,
-            atlas, self.font_revisions[slot as usize], gid)
+        draw::glyph_page(
+            &mut self.paint_cache,
+            &mut self.textures,
+            &mut self.tex_free,
+            atlas,
+            self.font_revisions[slot as usize],
+            gid,
+            draw::GlyphPageUse::External,
+        )
+    }
+
+    /// Release superseded glyph-page textures previously pinned by
+    /// [`prepare_glyph_page`](Self::prepare_glyph_page) once external
+    /// consumers have finished referencing those handles.
+    pub fn release_external_glyph_pages(&mut self) {
+        self.paint_cache
+            .release_external_glyph_pages(&mut self.textures, &mut self.tex_free);
     }
 
     /// Prepare single-page, baked fonts within a coverage-byte budget before

@@ -21,7 +21,16 @@ pocket-linux-hooks = { workspace = true, default-features = true }
 pocket-linux-fbdev = { workspace = true, default-features = true }
 pocket-linux-evdev = { workspace = true, default-features = true }
 rquickjs = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+base64 = { workspace = true }
+percent-encoding = "2.3"
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = "1"
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
+qrcode = { version = "0.14", default-features = false }
 libc = "0.2.191"
 zune-jpeg = "0.5"
 rqrr = { version = "0.11", default-features = false }

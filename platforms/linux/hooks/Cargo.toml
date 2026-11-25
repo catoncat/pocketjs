@@ -11,4 +11,6 @@ license.workspace = true
 
 [dependencies]
 pocket-drivers = { workspace = true, default-features = true }
+pocketjs-core = { workspace = true, default-features = true }
+memmap2 = { workspace = true }
 libc = "0.2.191"

@@ -25,16 +25,19 @@ use pocket_runtime::{
 use std::{
     error::Error,
     io,
+    os::fd::AsRawFd,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
 mod device;
 mod http;
 mod keymap;
+mod rex;
 mod shot;
 mod video;
 mod worker;
@@ -70,6 +73,7 @@ struct Options {
     store: Option<PathBuf>,
     audio_device: Option<String>,
     mock: bool,
+    connect_local: bool,
     check: bool,
 }
 
@@ -100,6 +104,7 @@ fn options() -> Result<Option<Options>, Box<dyn Error>> {
             }
             "--check" => output.check = true,
             "--mock" => output.mock = true,
+            "--connect-local" => output.connect_local = true,
             "--package" | "--fb" | "--input" | "--control" | "--unit" | "--shot" | "--script" | "--store" | "--audio-device" => {
                 let value = args.next().ok_or_else(|| error("missing option value"))?;
                 match arg.as_str() {
@@ -175,7 +180,11 @@ impl Guest for ZeroGuest {
         Ok(())
     }
     fn evaluate(&mut self, code: &[u8]) -> Result<(), RuntimeError> {
-        self.inner.evaluate(code)
+        self.inner.evaluate(code).inspect_err(|_| {
+            if let Some(err) = self.inner.last_error() {
+                eprintln!("pocket-cardputer-zero: guest evaluate: {err}");
+            }
+        })
     }
     fn frame(&mut self, frame: &GuestFrame<'_>) -> Result<(), RuntimeError> {
         if let Some(fault) = self.worker.as_ref().and_then(worker::Worker::fault) {
@@ -197,16 +206,49 @@ impl Guest for ZeroGuest {
                 return Err(Self::fail(message));
             }
         }
-        self.inner.frame(frame)
+        self.inner.frame(frame).inspect_err(|_| {
+            if let Some(err) = self.inner.last_error() {
+                eprintln!("pocket-cardputer-zero: guest frame: {err}");
+            }
+        })
     }
     fn collect(&mut self) -> Result<(), RuntimeError> {
-        self.inner.collect()
+        self.inner.collect().inspect_err(|_| {
+            if let Some(err) = self.inner.last_error() {
+                eprintln!("pocket-cardputer-zero: guest collect: {err}");
+            }
+        })
     }
     fn shutdown(&mut self) {
         self.detach();
         self.worker = None;
         self.inner.shutdown()
     }
+}
+
+struct CleanupGuard {
+    rex: Arc<rex::RexZeroEngine>,
+    device: Option<device::Device>,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        self.rex.shutdown();
+        // A microphone capture, a camera stream and a raised preamplifier must
+        // not outlive the program — even if boot, tick, or shutdown fails.
+        if let Some(device) = &self.device {
+            device.stop();
+        }
+    }
+}
+
+fn hash_draw_words(words: &[u32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &w in words {
+        h ^= w as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 fn run(options: Options) -> Result<(), Box<dyn Error>> {
@@ -235,6 +277,32 @@ fn run(options: Options) -> Result<(), Box<dyn Error>> {
     if pocket_drivers::PackageSource::length(&source).map_err(error)? > PACKAGE_LIMIT {
         return Err(error("package exceeds 16 MiB").into());
     }
+    // Register on-demand CJK fallback TTF/TTC (`mmap`, 0 KB anonymous heap on cp0) before loading atlases.
+    let pkg_noto = path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|r| r.join("app/fonts/NotoSansCJKsc-Regular.otf"));
+    let pkg_font = path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|r| r.join("app/fonts/DroidSansFallbackFull.ttf"));
+    let cwd_noto = PathBuf::from("app/fonts/NotoSansCJKsc-Regular.otf");
+    let vendor_noto = PathBuf::from("../../app/fonts/NotoSansCJKsc-Regular.otf");
+    let cwd_font = PathBuf::from("app/fonts/DroidSansFallbackFull.ttf");
+    let vendor_font = PathBuf::from("../../app/fonts/DroidSansFallbackFull.ttf");
+    let mut font_candidates: Vec<&std::path::Path> = Vec::new();
+    if let Some(ref pn) = pkg_noto {
+        font_candidates.push(pn.as_path());
+    }
+    font_candidates.push(cwd_noto.as_path());
+    font_candidates.push(vendor_noto.as_path());
+    if let Some(ref pf) = pkg_font {
+        font_candidates.push(pf.as_path());
+    }
+    font_candidates.push(cwd_font.as_path());
+    font_candidates.push(vendor_font.as_path());
+    pocket_linux_hooks::install_system_cjk_fallback(&font_candidates);
+
     let mut runtime = Runtime::new(RuntimeConfig {
         profile_hash: profile::PROFILE_HASH,
         host_abi: profile::HOST_ABI,
@@ -243,10 +311,13 @@ fn run(options: Options) -> Result<(), Box<dyn Error>> {
         profile: profile.clone(),
     })
     .map_err(error)?;
+    let ops = runtime.op_context();
     let renderer = runtime
         .add_renderer(pocket_raster::RasterRenderer::new(profile.density).map_err(error)?)
         .map_err(error)?;
     let headless = options.shot.is_some();
+    let activity_seq = Arc::new(AtomicU64::new(1));
+    let mut idle_evdev_watchers: Vec<std::fs::File> = Vec::new();
     let mut shot = match options.shot {
         Some(directory) => Some(shot::attach(
             &mut runtime,
@@ -256,7 +327,14 @@ fn run(options: Options) -> Result<(), Box<dyn Error>> {
             options.script.as_deref().unwrap_or(""),
         )?),
         None => {
-            attach_devices(&mut runtime, renderer, &profile, options.fb, options.inputs)?;
+            idle_evdev_watchers = attach_devices(
+                &mut runtime,
+                renderer,
+                &profile,
+                options.fb,
+                options.inputs,
+                activity_seq.clone(),
+            )?;
             None
         }
     };
@@ -276,15 +354,38 @@ fn run(options: Options) -> Result<(), Box<dyn Error>> {
         None
     };
     if let Some(device) = &device {
-        runtime.add_provider(Box::new(video::CameraPlane::new(device.clone()))).map_err(error)?;
+        runtime
+            .add_provider(Box::new(video::CameraPlane::new(device.clone())))
+            .map_err(error)?;
     }
     let notify = Arc::new(worker::Notify::default());
-    let http = Arc::new(http::Http::new(
-        options.control.unwrap_or_else(|| DEFAULT_CONTROL.into()),
-        options.unit.unwrap_or_else(|| http::COMPANION_UNIT.into()),
-        notify.clone(),
-        device.clone(),
-    ));
+    let (ui_wake_pipe, ui_waker) = rex::transport::WakePipe::new().map_err(error)?;
+    let connect_local =
+        options.connect_local || std::env::var_os("REX_ZERO_CONNECT_LOCAL").is_some();
+    let rex_engine = if options.mock {
+        Arc::new(rex::RexZeroEngine::new_mock(device.clone()))
+    } else {
+        Arc::new(rex::RexZeroEngine::new_live(
+            device.clone(),
+            headless,
+            connect_local,
+        ))
+    };
+    let cleanup = CleanupGuard {
+        rex: rex_engine.clone(),
+        device: device.clone(),
+    };
+    rex_engine.attach_ui_waker(activity_seq.clone(), ui_waker.clone());
+    let http = Arc::new(
+        http::Http::new(
+            options.control.unwrap_or_else(|| DEFAULT_CONTROL.into()),
+            options.unit.unwrap_or_else(|| http::COMPANION_UNIT.into()),
+            notify.clone(),
+            device,
+        )
+        .with_rex(rex_engine)
+        .with_ui_waker(activity_seq.clone(), ui_waker),
+    );
     runtime
         .set_guest(Box::new(ZeroGuest {
             inner: RquickjsGuest::default(),
@@ -301,25 +402,174 @@ fn run(options: Options) -> Result<(), Box<dyn Error>> {
     }
     let mut clock = MonotonicClock::default();
     let mut schedule = TickSchedule::new(profile.tick_hz, clock.now(), 1).map_err(error)?;
+    let active_window = Duration::from_millis(2200);
+    let mut active_until = Instant::now() + active_window;
+    let mut seen_activity = activity_seq.load(Ordering::Acquire);
+    let mut last_draw_hash = ops
+        .core()
+        .map(|c| hash_draw_words(&c.ui.current_draw_list().words))
+        .unwrap_or(0);
+    let mut ui_frame_pending = true;
+
     while !STOP.load(Ordering::Relaxed) && !http::QUIT.load(Ordering::Relaxed) {
-        schedule.wait_next(&mut clock).map_err(error)?;
         if let Some(shot) = shot.as_mut() {
+            schedule.wait_next(&mut clock).map_err(error)?;
             if !shot.before_tick() {
                 break;
             }
-        }
-        runtime.tick().map_err(error)?;
-        if let Some(shot) = shot.as_mut() {
+            runtime.tick().map_err(error)?;
             shot.after_tick()?;
+            continue;
+        }
+
+        // 1. Drain wakeup pipe and evdev watchers BEFORE sampling `activity_seq` so a
+        // completion between load and drain can never lose its wake byte!
+        ui_wake_pipe.drain();
+        let evdev_woke = drain_evdev_watchers(&mut idle_evdev_watchers);
+        let cur_activity = activity_seq.load(Ordering::Acquire);
+        if evdev_woke || cur_activity != seen_activity {
+            seen_activity = cur_activity;
+            active_until = Instant::now() + active_window;
+        }
+
+        if Instant::now() >= active_until {
+            // Re-check `activity_seq` immediately before parking in `poll()`.
+            let recheck = activity_seq.load(Ordering::Acquire);
+            if recheck != seen_activity {
+                seen_activity = recheck;
+                active_until = Instant::now() + active_window;
+                schedule.wait_next(&mut clock).map_err(error)?;
+            } else {
+                // Include pending UI frame deadlines (`schedule.deadline()`) when an animation
+                // or UI update is still active past `active_until`, so animations stay at 30fps!
+                let poll_timeout_ms = if ui_frame_pending {
+                    let next_us = schedule.deadline().map_err(error)?;
+                    let rem_us = next_us.saturating_sub(clock.now());
+                    ((rem_us + 999) / 1000).min(250) as i32
+                } else {
+                    250
+                };
+
+                let mut pfds = Vec::with_capacity(1 + idle_evdev_watchers.len());
+                pfds.push(libc::pollfd {
+                    fd: ui_wake_pipe.read_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+                for f in &idle_evdev_watchers {
+                    pfds.push(libc::pollfd {
+                        fd: f.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+                let _ = unsafe {
+                    libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, poll_timeout_ms)
+                };
+                if STOP.load(Ordering::Relaxed) || http::QUIT.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Retire any disconnected/errored evdev descriptors (`POLLHUP`/`POLLERR`/`POLLNVAL`).
+                for idx in (0..idle_evdev_watchers.len()).rev() {
+                    let rev = pfds[1 + idx].revents;
+                    if (rev & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
+                        && (rev & libc::POLLIN) == 0
+                    {
+                        idle_evdev_watchers.swap_remove(idx);
+                    }
+                }
+
+                ui_wake_pipe.drain();
+                let post_evdev_woke = drain_evdev_watchers(&mut idle_evdev_watchers);
+                let next_activity = activity_seq.load(Ordering::Acquire);
+                if post_evdev_woke || next_activity != seen_activity {
+                    seen_activity = next_activity;
+                    active_until = Instant::now() + active_window;
+                    schedule = TickSchedule::new(profile.tick_hz, clock.now(), 1).map_err(error)?;
+                } else if ui_frame_pending {
+                    schedule.wait_next(&mut clock).map_err(error)?;
+                } else {
+                    schedule = TickSchedule::new(profile.tick_hz, clock.now(), 1).map_err(error)?;
+                }
+            }
+        } else {
+            schedule.wait_next(&mut clock).map_err(error)?;
+        }
+
+        let epoch_before = ops.core().map(|c| c.epoch).unwrap_or(0);
+        runtime.tick().map_err(error)?;
+        let (epoch_after, draw_hash) = ops
+            .core()
+            .map(|c| (c.epoch, hash_draw_words(&c.ui.current_draw_list().words)))
+            .unwrap_or((epoch_before, last_draw_hash));
+        // An idle `runtime.tick()` with zero guest UI ops borrows `core_mut` 3 times (`encode`,
+        // `ui.tick`, `present`). Any guest UI op (`epoch_delta > 3`) or changed `DrawList` means
+        // UI work / animation is active and expects the next frame on `schedule.deadline()`.
+        ui_frame_pending =
+            epoch_after.wrapping_sub(epoch_before) > 3 || draw_hash != last_draw_hash;
+        last_draw_hash = draw_hash;
+
+        let post_tick_activity = activity_seq.load(Ordering::Acquire);
+        if post_tick_activity != seen_activity {
+            seen_activity = post_tick_activity;
+            active_until = Instant::now() + active_window;
         }
     }
-    runtime.shutdown().map_err(error)?;
-    // A microphone capture, a camera stream and a raised preamplifier must
-    // not outlive the program.
-    if let Some(device) = device {
-        device.stop();
-    }
+    let shutdown_res = runtime.shutdown().map_err(error);
+    drop(cleanup);
+    shutdown_res?;
     Ok(())
+}
+
+fn drain_evdev_watchers(files: &mut Vec<std::fs::File>) -> bool {
+    use std::io::Read;
+    let mut any = false;
+    let mut buf = [0u8; 512];
+    files.retain_mut(|f| loop {
+        match f.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(_) => {
+                any = true;
+            }
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return true;
+            }
+            Err(_) => return false,
+        }
+    });
+    any
+}
+
+#[cfg(target_os = "linux")]
+struct TrackedInput<S> {
+    inner: S,
+    activity: Arc<AtomicU64>,
+}
+
+#[cfg(target_os = "linux")]
+impl<S: pocket_drivers::InputSource> pocket_drivers::InputSource for TrackedInput<S> {
+    fn classes(&self) -> InputClasses {
+        self.inner.classes()
+    }
+    fn poll(&mut self, frame: &mut pocket_drivers::InputFrameBuilder) {
+        let prev_text = frame.text.len();
+        let prev_contacts = frame.contacts.len();
+        let prev_cancelled = frame.cancelled.len();
+        self.inner.poll(frame);
+        if frame.buttons != 0
+            || frame.text.len() != prev_text
+            || frame.contacts.len() != prev_contacts
+            || frame.cancelled.len() != prev_cancelled
+        {
+            self.activity.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The panel and the keyboard. Linux only: on another system the program
@@ -331,7 +581,9 @@ fn attach_devices(
     profile: &pocket_runtime::Profile,
     fb: Option<PathBuf>,
     inputs: Vec<PathBuf>,
-) -> Result<(), Box<dyn Error>> {
+    activity: Arc<AtomicU64>,
+) -> Result<Vec<std::fs::File>, Box<dyn Error>> {
+    use std::os::unix::fs::OpenOptionsExt;
     let size = profile.viewport;
     let mut display = pocket_linux_fbdev::open(fb.unwrap_or_else(|| "/dev/fb0".into()))?;
     // The panel is this program's while it runs: frames redraw what changed.
@@ -363,6 +615,7 @@ fn attach_devices(
             inputs.sort();
         }
     }
+    let mut watchers = Vec::new();
     for (index, path) in inputs.iter().take(16).enumerate() {
         let mut device = pocket_linux_evdev::Evdev::open(
             path,
@@ -371,9 +624,21 @@ fn attach_devices(
             16,
         )?;
         device.set_symbols(symbols.clone());
-        runtime.add_input_source(Box::new(device)).map_err(error)?;
+        runtime
+            .add_input_source(Box::new(TrackedInput {
+                inner: device,
+                activity: activity.clone(),
+            }))
+            .map_err(error)?;
+        if let Ok(watcher) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+        {
+            watchers.push(watcher);
+        }
     }
-    Ok(())
+    Ok(watchers)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -383,11 +648,29 @@ fn attach_devices(
     _: &pocket_runtime::Profile,
     _: Option<PathBuf>,
     _: Vec<PathBuf>,
-) -> Result<(), Box<dyn Error>> {
+    _: Arc<AtomicU64>,
+) -> Result<Vec<std::fs::File>, Box<dyn Error>> {
     Err(error("the panel and keyboard drivers require Linux").into())
 }
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some("--rex-socks5-stdio") {
+        if let (Some(proxy), Some(host), Some(port_s)) =
+            (raw_args.get(2), raw_args.get(3), raw_args.get(4))
+        {
+            if let Ok(port) = port_s.parse::<u16>() {
+                if let Err(err) = rex::transport::run_socks5_stdio_bridge(proxy, host, port) {
+                    eprintln!("rex-socks5-stdio: {err}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+        }
+        eprintln!("usage: pocket-cardputer-zero --rex-socks5-stdio <127.0.0.1:port> <host> <port>");
+        std::process::exit(2);
+    }
+
     match options().and_then(|options| match options {
         Some(options) => run(options),
         None => Ok(()),

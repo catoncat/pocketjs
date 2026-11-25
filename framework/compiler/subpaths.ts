@@ -94,6 +94,7 @@ export const SUBPATHS: Record<string, SubpathDecl> = {
   "media/audio": { file: "contracts/spec/media-adpcm.ts" },
   clock: { file: "framework/src/clock.ts", aliases: TWINS },
   compact: { file: { solid: "framework/src/compact/index.ts" } },
+  "compact/primitives": { file: { solid: "framework/src/compact/primitives.ts" } },
   worker: { file: "framework/src/worker.ts", domains: ["worker"] },
   "worker/channels": { file: "framework/src/worker-channels.ts" },
   io: { file: "framework/src/io.ts", domains: ["worker"] },

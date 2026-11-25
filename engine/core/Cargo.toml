@@ -29,6 +29,8 @@ taffy = { version = "0.11", default-features = false, features = [
     "flexbox",
     "content_size",
 ] }
+# On-demand CJK fallback glyph rasterizer (#![no_std] + alloc via libm).
+ab_glyph = { version = "0.2", default-features = false, features = ["libm"] }
 
 [features]
 default = []

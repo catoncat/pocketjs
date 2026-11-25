@@ -98,6 +98,7 @@
     "./media/audio": "./contracts/spec/media-adpcm.ts",
     "./clock": "./framework/src/clock.ts",
     "./compact": "./framework/src/compact/index.ts",
+    "./compact/primitives": "./framework/src/compact/primitives.ts",
     "./worker": "./framework/src/worker.ts",
     "./worker/channels": "./framework/src/worker-channels.ts",
     "./io": "./framework/src/io.ts",
